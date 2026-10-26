@@ -15,6 +15,21 @@ pub fn resolve_threads(requested: usize) -> usize {
     }
 }
 
+/// Physical memory that is free right now, in bytes (4 GiB when the system does not say).
+pub fn available_memory() -> u64 {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+        // SAFETY: `status` is a plain C struct that the call fills in; its length field is set as required.
+        let mut status: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+        status.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+        if unsafe { GlobalMemoryStatusEx(&mut status) } != 0 {
+            return status.ullAvailPhys;
+        }
+    }
+    4 << 30
+}
+
 enum Slot<T> {
     Ready(T),
     Pending(Receiver<T>),

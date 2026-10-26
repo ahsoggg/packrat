@@ -15,7 +15,7 @@ USAGE:
                       [--encoding NAME] [PASSWORD OPTIONS]
   packrat-cli test <archive> [--sha256] [--threads N] [--encoding NAME] [PASSWORD OPTIONS]
   packrat-cli create <output> <paths...> [--format FMT] [--level N] [--threads N]
-                      [PASSWORD OPTIONS] [--no-encrypt-names] [--no-filters]
+                      [PASSWORD OPTIONS] [--no-encrypt-names] [--no-filters] [--dict-mb N] [--solid-mb N]
   packrat-cli bench-gen <dir> [--mb N]     write the deterministic data set used by scripts/bench.ps1
   packrat-cli --version | --help
 
@@ -32,6 +32,9 @@ PASSWORD OPTIONS: --ask-password | --password-file FILE | env PACKRAT_PASSWORD
   (--no-encrypt-names keeps them visible). TAR cannot be encrypted.
   7z sorts files by type, runs a BCJ filter over executables and stores already-packed files (JPEG, MP4, ZIP...)
   as they are; --no-filters keeps the input order and compresses everything the same way.
+  --dict-mb sets the 7z (LZMA2) dictionary and --solid-mb the size of one solid block. By default the dictionary
+  follows the level (16 MiB at 5, 64 MiB at 9, never more than the data) and a block is eight dictionaries, at
+  least 64 MiB; bigger values pack better and use more memory. Encoders never take more than half of free RAM.
 
 ENCODING: for old ZIP files whose names have no encoding information, Packrat guesses (cp866, cp1251, cp437,
   shift_jis, gbk, big5, euc-kr); --encoding NAME forces one.
@@ -343,6 +346,8 @@ fn cmd_extract(mut args: Args) -> Result<u8, String> {
 fn cmd_create(mut args: Args) -> Result<u8, String> {
     let no_names = args.flag("--no-encrypt-names");
     let no_filters = args.flag("--no-filters");
+    let dict_mb = args.number(&["--dict-mb"])?;
+    let solid_mb = args.number(&["--solid-mb"])?;
     let oo = open_options(&mut args)?;
     let format_name = args.value(&["--format", "-f"])?;
     let level = args.number(&["--level", "-l"])?;
@@ -372,6 +377,12 @@ fn cmd_create(mut args: Args) -> Result<u8, String> {
     opts.password = oo.password;
     opts.encrypt_names = !no_names;
     opts.smart = !no_filters;
+    if let Some(mb) = dict_mb {
+        // LZMA2 allows up to 1 GiB less one byte; the encoder checks the exact limit
+        opts.dict_bytes =
+            Some(u32::try_from(mb.saturating_mul(1 << 20)).map_err(|_| "--dict-mb is too large (the limit is 1023)")?);
+    }
+    opts.solid_bytes = solid_mb.map(|mb| (mb as u64).saturating_mul(1 << 20));
 
     let started = std::time::Instant::now();
     let report = create_archive(&output, &inputs, &opts, &Progress::new()).map_err(|e| e.to_string())?;

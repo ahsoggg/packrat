@@ -64,6 +64,10 @@ pub struct CreateOptions {
     pub encrypt_names: bool,
     /// 7z only: sort files by type, filter executables (BCJ) and store already-packed files (see `analyze`).
     pub smart: bool,
+    /// 7z only: LZMA2 dictionary in bytes (`None`: chosen from the level and the data size).
+    pub dict_bytes: Option<u32>,
+    /// 7z only: size of one solid block in bytes (`None`: eight dictionaries, at least 64 MiB).
+    pub solid_bytes: Option<u64>,
 }
 
 impl CreateOptions {
@@ -76,6 +80,8 @@ impl CreateOptions {
             password: None,
             encrypt_names: true,
             smart: true,
+            dict_bytes: None,
+            solid_bytes: None,
         }
     }
 }
@@ -152,7 +158,8 @@ fn write_to(output: &Path, items: &[InputItem], opts: &CreateOptions, progress: 
                 password: opts.password.clone(),
                 encrypt_names: opts.encrypt_names,
                 smart: opts.smart,
-                ..Default::default()
+                dict_bytes: opts.dict_bytes,
+                solid_bytes: opts.solid_bytes,
             };
             sevenz::write_7z(file, items, &sopts, progress)?;
         }

@@ -205,3 +205,33 @@ fn empty_file_before_many_directories_gives_a_header_7zip_accepts() {
         }
     }
 }
+
+/// A repeat at a distance that no power-of-two window can hold exactly: the dictionary size written to the header
+/// must be one the writer and readers agree on, or the second copy fails to decode.
+#[test]
+fn far_repeat_survives_an_odd_dictionary_size() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("data");
+    fs::create_dir_all(&src).unwrap();
+    let block = noise(3_200_000, 77);
+    fs::write(src.join("a.bin"), &block).unwrap();
+    fs::write(src.join("b.bin"), &block).unwrap(); // the same bytes again, ~3.2 MB later
+    for (dict, solid) in [
+        (Some(3 * (1 << 20) + 100_000), None),
+        (None, None),
+        (Some(1 << 20), Some(1 << 20)),
+    ] {
+        let out = dir.path().join(format!("odd-{dict:?}-{solid:?}.7z"));
+        let mut opts = CreateOptions::new(Format::SevenZ);
+        opts.dict_bytes = dict;
+        opts.solid_bytes = solid;
+        create_archive(&out, std::slice::from_ref(&src), &opts, &Progress::new()).unwrap();
+        let a = open(&out).unwrap();
+        assert_eq!(read_entry(&*a, "data/a.bin"), block);
+        assert_eq!(read_entry(&*a, "data/b.bin"), block);
+        if let Some(z) = seven_zip() {
+            let (ok, log) = run(&z, &["t", out.to_str().unwrap()]);
+            assert!(ok, "7z t failed for dict {dict:?}: {log}");
+        }
+    }
+}

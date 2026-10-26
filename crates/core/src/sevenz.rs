@@ -225,8 +225,11 @@ pub struct SevenZOptions {
     /// LZMA2 level 1..=9 (memory per worker grows quickly above 7).
     pub level: u32,
     pub threads: usize,
-    /// Target size of one solid block; blocks are compressed in parallel.
-    pub block_bytes: u64,
+    /// LZMA2 dictionary in bytes; `None` picks one for the level (and never more than the data needs).
+    pub dict_bytes: Option<u32>,
+    /// Target size of one solid block; `None` is eight dictionaries, at least 64 MiB. Blocks are compressed in
+    /// parallel, and a bigger block finds more repeats (7-Zip's blocks are in the gigabytes).
+    pub solid_bytes: Option<u64>,
     /// Encrypt the contents with AES-256.
     pub password: Option<CorePassword>,
     /// With a password: also encrypt the file names (the header).
@@ -240,12 +243,67 @@ impl Default for SevenZOptions {
         Self {
             level: 5,
             threads: 0,
-            block_bytes: 64 << 20,
+            dict_bytes: None,
+            solid_bytes: None,
             password: None,
             encrypt_names: true,
             smart: true,
         }
     }
+}
+
+/// LZMA2 dictionary for a level. Bigger than xz's presets from level 4 up, closer to 7-Zip's (16 MiB at 5,
+/// 64 MiB at 9): the dictionary is the biggest single factor in how much repeated data is found.
+fn default_dict(level: u32) -> u32 {
+    const MIB: u32 = 1 << 20;
+    [
+        MIB,
+        2 * MIB,
+        4 * MIB,
+        8 * MIB,
+        16 * MIB,
+        16 * MIB,
+        32 * MIB,
+        64 * MIB,
+        64 * MIB,
+    ][(level.clamp(1, 9) - 1) as usize]
+}
+
+/// Rounds a dictionary size up to one that the 7z header can state exactly. The LZMA2 property is a single byte
+/// that holds only 2^n and 3 * 2^(n-1); the writer rounds any other size down in the header while the encoder
+/// still uses the full size, so readers get a window that is too small and fail on far matches (7-Zip reports
+/// a data error). The largest the format and the encoder allow is 3 * 2^28.
+fn lzma2_dict(size: u32) -> u32 {
+    const MAX: u32 = 3 << 28;
+    if size >= MAX {
+        return MAX;
+    }
+    let size = size.max(1 << 12);
+    let base = 1u32 << (31 - size.leading_zeros());
+    if size == base {
+        base
+    } else if size <= base + base / 2 {
+        base + base / 2
+    } else {
+        base * 2
+    }
+}
+
+/// Memory one LZMA2 encoder needs for this dictionary.
+fn encoder_bytes(level: u32, dict: u32) -> u64 {
+    let mut o = lzma_rust2::Lzma2Options::with_preset(level);
+    o.lzma_options.dict_size = dict;
+    u64::from(o.lzma_options.get_memory_usage()) * 1024
+}
+
+/// Splits the threads between solid blocks and LZMA2 workers inside a block: (blocks packed at the same
+/// time, workers per block). At most half of the free memory goes to encoders, whatever the thread count, so
+/// a big dictionary on many cores cannot push the machine into swapping.
+fn spread(threads: usize, blocks: usize, encoder_bytes: u64, free_memory: u64) -> (usize, usize) {
+    let by_memory = usize::try_from(free_memory / 2 / encoder_bytes.max(1)).unwrap_or(usize::MAX);
+    let total = threads.min(by_memory).max(1);
+    let parallel = total.min(blocks.max(1));
+    (parallel, (total / parallel).max(1))
 }
 
 enum Piece {
@@ -294,6 +352,18 @@ pub fn write_7z<W: Write + Seek>(out: W, items: &[InputItem], opts: &SevenZOptio
         }
         order.sort_by_cached_key(|&i| analyze::solid_key(&items[i], classes[i]));
     }
+    let compressible: u64 = order
+        .iter()
+        .filter(|&&i| classes[i] != Class::Packed)
+        .map(|&i| items[i].size)
+        .sum();
+    let dict = lzma2_dict(
+        opts.dict_bytes
+            .unwrap_or_else(|| default_dict(level))
+            .min(u32::try_from(compressible).unwrap_or(u32::MAX))
+            .max(1 << 16),
+    );
+    let block_bytes = opts.solid_bytes.unwrap_or_else(|| (u64::from(dict) * 8).max(64 << 20));
     let mut groups: Vec<Vec<usize>> = Vec::new();
     let mut group_class: Vec<Class> = Vec::new();
     let mut cur: Vec<usize> = Vec::new();
@@ -306,7 +376,7 @@ pub fn write_7z<W: Write + Seek>(out: W, items: &[InputItem], opts: &SevenZOptio
         }
         cur.push(i);
         cur_bytes += items[i].size;
-        if cur_bytes >= opts.block_bytes {
+        if cur_bytes >= block_bytes {
             group_class.push(classes[i]);
             groups.push(std::mem::take(&mut cur));
             cur_bytes = 0;
@@ -318,11 +388,27 @@ pub fn write_7z<W: Write + Seek>(out: W, items: &[InputItem], opts: &SevenZOptio
     }
     let threads = crate::par::resolve_threads(opts.threads);
     let compressed_groups = group_class.iter().filter(|c| **c != Class::Packed).count();
-    let lzma = if compressed_groups == 1 && threads > 1 {
-        Lzma2Options::from_level_mt(level, threads as u32, (opts.block_bytes / 4).max(4 << 20))
+    let (parallel_blocks, lzma_threads) = spread(
+        threads,
+        compressed_groups,
+        encoder_bytes(level, dict),
+        crate::par::available_memory(),
+    );
+    let mut lzma = if lzma_threads > 1 {
+        // Each worker packs one chunk on its own. A chunk of four dictionaries loses little to the cut, but
+        // when the block is smaller than that there would be one chunk and one busy thread, so the chunk is
+        // the block divided between the workers, never smaller than a dictionary (the encoder enforces that).
+        let per_block = compressible / compressed_groups.max(1) as u64;
+        let dict = u64::from(dict);
+        Lzma2Options::from_level_mt(
+            level,
+            lzma_threads as u32,
+            (per_block / lzma_threads as u64).clamp(dict, dict * 4),
+        )
     } else {
         Lzma2Options::from_level(level)
     };
+    lzma.set_dictionary_size(dict);
     let lzma_conf = EncoderConfiguration::new(EncoderMethod::LZMA2).with_options(EncoderOptions::Lzma2(lzma));
     // The chain lists the stage nearest the file first. Data flows through it from the end: filter, then LZMA2,
     // then AES (as 7-Zip writes it). Every block gets its own random IV and salt.
@@ -353,7 +439,7 @@ pub fn write_7z<W: Write + Seek>(out: W, items: &[InputItem], opts: &SevenZOptio
     let mut writer = sevenz_rust2::ArchiveWriter::new(out).map_err(map_err)?;
     writer.set_content_methods((*chain_for_block(Class::Data)).clone());
     writer.set_encrypt_header(opts.encrypt_names);
-    let mut pool = OrderedPool::<Piece>::new(opts.threads)?;
+    let mut pool = OrderedPool::<Piece>::new(parallel_blocks)?;
     let mut deliver = |piece: Piece| -> Result<()> {
         progress.check()?;
         match piece {
@@ -423,4 +509,80 @@ pub fn write_7z<W: Write + Seek>(out: W, items: &[InputItem], opts: &SevenZOptio
     pool.finish(&mut deliver)?;
     writer.finish().map_err(Error::from)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const GIB: u64 = 1 << 30;
+
+    #[test]
+    fn dictionaries_grow_with_the_level() {
+        let d: Vec<u32> = (1..=9).map(default_dict).collect();
+        assert!(d.windows(2).all(|w| w[0] <= w[1]), "{d:?}");
+        assert_eq!(default_dict(5), 16 << 20);
+        assert_eq!(default_dict(9), 64 << 20);
+        assert_eq!(default_dict(0), default_dict(1));
+        assert_eq!(default_dict(99), default_dict(9));
+    }
+
+    #[test]
+    fn dictionary_sizes_are_representable_in_the_header() {
+        let ok = |s: u32| {
+            let n = 31 - s.leading_zeros();
+            s == 1 << n || s == 3 << (n - 1)
+        };
+        for size in [
+            1,
+            4096,
+            65_537,
+            3_000_000,
+            33 << 20,
+            40 << 20,
+            44_343_567,
+            64 << 20,
+            700 << 20,
+            u32::MAX,
+        ] {
+            let d = lzma2_dict(size);
+            assert!(ok(d), "{size} -> {d}");
+            assert!(d >= size.min(3 << 28), "{size} -> {d} must not shrink");
+            assert!(d <= 3 << 28);
+        }
+        assert_eq!(lzma2_dict(16 << 20), 16 << 20);
+        assert_eq!(lzma2_dict(24 << 20), 24 << 20);
+        assert_eq!(lzma2_dict((16 << 20) + 1), 24 << 20);
+        assert_eq!(lzma2_dict((24 << 20) + 1), 32 << 20);
+    }
+
+    #[test]
+    fn many_blocks_use_threads_for_blocks() {
+        // plenty of memory: 8 blocks on 12 threads -> 8 at once, 1 worker each
+        assert_eq!(spread(12, 8, 100 << 20, 64 * GIB), (8, 1));
+        assert_eq!(spread(12, 40, 100 << 20, 64 * GIB), (12, 1));
+    }
+
+    #[test]
+    fn few_blocks_split_threads_inside_the_block() {
+        assert_eq!(spread(12, 1, 100 << 20, 64 * GIB), (1, 12));
+        assert_eq!(spread(12, 2, 100 << 20, 64 * GIB), (2, 6));
+        assert_eq!(spread(12, 5, 100 << 20, 64 * GIB), (5, 2));
+    }
+
+    #[test]
+    fn memory_limits_the_number_of_encoders() {
+        // 800 MB per encoder, 4 GiB free -> half is 2 GiB -> only 2 encoders
+        let (blocks, workers) = spread(12, 8, 800 << 20, 4 * GIB);
+        assert!(blocks * workers <= 2, "{blocks} x {workers}");
+        // never below one, even with no memory at all
+        assert_eq!(spread(12, 8, 800 << 20, 0), (1, 1));
+        assert_eq!(spread(1, 0, 1, 0), (1, 1));
+    }
+
+    #[test]
+    fn encoder_memory_grows_with_the_dictionary() {
+        assert!(encoder_bytes(9, 64 << 20) > encoder_bytes(5, 16 << 20));
+        assert!(encoder_bytes(5, 16 << 20) > 16 << 20);
+    }
 }
