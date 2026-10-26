@@ -8,8 +8,10 @@
 #![cfg(windows)]
 #![allow(clippy::missing_safety_doc)]
 
+use packrat_core::OpenOptions;
 use packrat_core::archive::Archive;
 use packrat_core::entry::{Entry, EntryKind};
+use packrat_core::error::Error;
 use packrat_core::prat::PratArchive;
 use packrat_core::source::Source;
 use std::ffi::c_void;
@@ -61,6 +63,8 @@ const IID_IUNKNOWN: Guid = Guid {
     d4: [0xC0, 0, 0, 0, 0, 0, 0, 0x46],
 };
 const IID_IIN_ARCHIVE: Guid = sz_guid(6, 0x60);
+/// `ICryptoGetTextPassword`, which 7-Zip's open and extract callbacks offer when a password may be needed.
+const IID_CRYPTO_GET_TEXT_PASSWORD: Guid = sz_guid(5, 0x10);
 /// The class id of this handler (any value that no other 7-Zip format uses).
 const CLSID_PRAT: Guid = Guid {
     d1: 0x5052_4154,
@@ -74,6 +78,7 @@ const KPID_PATH: u32 = 3;
 const KPID_IS_DIR: u32 = 6;
 const KPID_SIZE: u32 = 7;
 const KPID_ATTRIB: u32 = 9;
+const KPID_ENCRYPTED: u32 = 15;
 const KPID_MTIME: u32 = 12;
 const KPID_METHOD: u32 = 22;
 const KPID_PHY_SIZE: u32 = 44;
@@ -276,6 +281,12 @@ struct ExtractCallbackVtbl {
     set_operation_result: unsafe extern "system" fn(*mut c_void, i32) -> Hr,
 }
 
+#[repr(C)]
+struct PasswordVtbl {
+    base: UnknownVtbl,
+    get_text_password: unsafe extern "system" fn(*mut c_void, *mut *mut u16) -> Hr,
+}
+
 /// Any COM object starts with a pointer to its table.
 #[repr(C)]
 struct ComObject<V> {
@@ -443,7 +454,36 @@ unsafe extern "system" fn ia_release(p: *mut c_void) -> u32 {
     left
 }
 
-unsafe extern "system" fn ia_open(p: *mut c_void, stream: *mut c_void, _max: *const u64, _cb: *mut c_void) -> Hr {
+/// Asks 7-Zip for the password through the callback it gave to `Open` (this is what makes 7-Zip show its password
+/// box, or use the one from `-p`). `Err` carries the code to return from `Open`: `E_ABORT` when the user cancels.
+unsafe fn ask_password(callback: *mut c_void) -> std::result::Result<String, Hr> {
+    if callback.is_null() {
+        return Err(S_FALSE);
+    }
+    unsafe {
+        let mut iface: *mut c_void = null_mut();
+        let hr = (vtbl::<UnknownVtbl>(callback).query_interface)(callback, &IID_CRYPTO_GET_TEXT_PASSWORD, &mut iface);
+        if hr != S_OK || iface.is_null() {
+            return Err(S_FALSE);
+        }
+        let mut bstr: *mut u16 = null_mut();
+        let hr = (vtbl::<PasswordVtbl>(iface).get_text_password)(iface, &mut bstr);
+        release(iface);
+        if hr != S_OK {
+            return Err(hr);
+        }
+        if bstr.is_null() {
+            return Ok(String::new());
+        }
+        // a BSTR is preceded by its length in bytes
+        let bytes = *(bstr as *const u32).sub(1) as usize;
+        let text = String::from_utf16_lossy(std::slice::from_raw_parts(bstr, bytes / 2));
+        SysFreeString(bstr);
+        Ok(text)
+    }
+}
+
+unsafe extern "system" fn ia_open(p: *mut c_void, stream: *mut c_void, _max: *const u64, callback: *mut c_void) -> Hr {
     guarded(|| {
         if stream.is_null() {
             return E_INVALIDARG;
@@ -452,15 +492,25 @@ unsafe extern "system" fn ia_open(p: *mut c_void, stream: *mut c_void, _max: *co
             return S_FALSE;
         };
         let len = src.len;
-        match PratArchive::from_source(Arc::new(src)) {
-            Ok(archive) => {
-                *unsafe { this(p) }.state.lock().unwrap_or_else(|e| e.into_inner()) =
-                    Some(Arc::new(State { archive, len }));
-                S_OK
+        let src = Arc::new(src);
+        let archive = match PratArchive::from_source_with(src.clone(), &OpenOptions::default()) {
+            Ok(a) => a,
+            Err(Error::PasswordRequired) => {
+                let password = match unsafe { ask_password(callback) } {
+                    Ok(pw) => pw,
+                    Err(hr) => return hr,
+                };
+                match PratArchive::from_source_with(src, &OpenOptions::default().with_password(&password)) {
+                    Ok(a) => a,
+                    // a wrong password: 7-Zip reports that the file cannot be opened
+                    Err(_) => return S_FALSE,
+                }
             }
             // not an archive for this handler (7-Zip tries the next one) rather than a failure
-            Err(_) => S_FALSE,
-        }
+            Err(_) => return S_FALSE,
+        };
+        *unsafe { this(p) }.state.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(State { archive, len }));
+        S_OK
     })
 }
 
@@ -538,7 +588,11 @@ unsafe extern "system" fn ia_get_property(p: *mut c_void, index: u32, prop: u32,
                         }
                         S_OK
                     }
-                    KPID_METHOD => set_bstr(v, "PRAT"),
+                    KPID_METHOD => set_bstr(v, &e.method),
+                    KPID_ENCRYPTED => {
+                        set_bool(v, e.encrypted);
+                        S_OK
+                    }
                     _ => S_OK,
                 }
             })
@@ -565,12 +619,13 @@ unsafe extern "system" fn ia_get_archive_property(p: *mut c_void, prop: u32, v: 
 }
 
 /// The columns 7-Zip may show: (property id, variant type).
-const COLUMNS: [(u32, u16); 6] = [
+const COLUMNS: [(u32, u16); 7] = [
     (KPID_PATH, VT_BSTR),
     (KPID_IS_DIR, VT_BOOL),
     (KPID_SIZE, VT_UI8),
     (KPID_MTIME, VT_FILETIME),
     (KPID_ATTRIB, VT_UI4),
+    (KPID_ENCRYPTED, VT_BOOL),
     (KPID_METHOD, VT_BSTR),
 ];
 

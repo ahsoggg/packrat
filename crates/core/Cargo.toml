@@ -8,8 +8,10 @@ description = "Packrat: archive formats, smart extraction, safety checks (no UI)
 
 [dependencies]
 aes = "0.9.3"
+argon2 = "0.5.3"
 blake3 = "1.8.2"
 bzip2 = "0.6.1"
+chacha20poly1305 = "0.10.1"
 cab = "0.6.0"
 chardetng = { version = "1.0.0", default-features = false }
 crc32fast = "1.5.2"
@@ -32,6 +34,7 @@ sha2 = "0.11.1"
 tar = { version = "0.4.46", default-features = false }
 unrar = "0.5.8"
 zstd = { version = "0.13.3", default-features = false }
+zeroize = "1.8.1"
 
 [dev-dependencies]
 tempfile = "3.27.0"

@@ -56,7 +56,7 @@ fn open_inner(src: SharedSource, name: &str, opts: &OpenOptions, path: Option<&P
         return Ok(Box::new(SevenZArchive::from_source_with(src, opts)?));
     }
     if head.starts_with(&prat::format::MAGIC) {
-        return Ok(Box::new(PratArchive::from_source(src)?));
+        return Ok(Box::new(PratArchive::from_source_with(src, opts)?));
     }
     if rar::is_rar(head) {
         return match path {

@@ -256,15 +256,3 @@ fn extraction_works_on_many_threads_and_matches_the_source() {
         }
     }
 }
-
-#[test]
-fn passwords_are_refused_until_encryption_exists() {
-    let dir = tempfile::tempdir().unwrap();
-    let src = sample(dir.path());
-    let mut opts = CreateOptions::new(Format::Prat);
-    opts.password = Some(packrat_core::Password::new("secret"));
-    let out = dir.path().join("p.prat");
-    let err = create_archive(&out, &[src], &opts, &Progress::new()).unwrap_err();
-    assert!(matches!(err, Error::Unsupported(_)), "{err}");
-    assert!(!out.exists());
-}

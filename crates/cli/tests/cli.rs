@@ -246,3 +246,117 @@ fn test_command_finds_damage_and_repair_rescues_a_cut_zip() {
         "content of file 0 ".repeat(3000)
     );
 }
+
+#[test]
+fn a_password_option_is_refused_before_anything_is_written() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("secret");
+    fs::create_dir_all(&src).unwrap();
+    fs::write(src.join("a.txt"), "classified").unwrap();
+    let archive = dir.path().join("oops.prat");
+    // `--password abc` used to be taken for a file named "abc" and an UNPROTECTED archive was made
+    let out = cli()
+        .arg("create")
+        .arg(&archive)
+        .arg(&src)
+        .args(["--format", "prat", "--password", "abc"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("unknown option") && err.contains("PACKRAT_PASSWORD"),
+        "{err}"
+    );
+    assert!(!archive.exists(), "no archive may be made when the options are wrong");
+    // other typos are refused too, but a file that really is called like an option still works
+    let out = cli().arg("list").arg("--frobnicate").output().unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("unknown option"));
+}
+
+#[test]
+fn encrypted_prat_roundtrips_through_the_cli_and_repairs_without_a_password() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("vault");
+    fs::create_dir_all(src.join("sub")).unwrap();
+    fs::write(src.join("a.txt"), "classified ".repeat(2000)).unwrap();
+    fs::write(
+        src.join("sub/b.bin"),
+        (0..200_000u32)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+    let archive = dir.path().join("vault.prat");
+    let out = cli()
+        .arg("create")
+        .arg(&archive)
+        .arg(&src)
+        .args(["--format", "prat", "--recovery", "10", "--kdf-mb", "1"])
+        .env("PACKRAT_PASSWORD", "pw 123 ключ")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let bytes = fs::read(&archive).unwrap();
+    assert!(
+        !bytes.windows(10).any(|w| w == b"classified"),
+        "plaintext in the archive"
+    );
+
+    // no password and a wrong password: refused with a clear message
+    let out = cli()
+        .arg("list")
+        .arg(&archive)
+        .env_remove("PACKRAT_PASSWORD")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("password is required"));
+    let out = cli()
+        .arg("test")
+        .arg(&archive)
+        .env("PACKRAT_PASSWORD", "nope")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("wrong password"));
+
+    // damage it, repair it with no password at all, then extract with the password
+    let mut damaged = bytes.clone();
+    damaged[300] ^= 0xff;
+    damaged[bytes.len() / 3] ^= 0xff;
+    fs::write(&archive, &damaged).unwrap();
+    let out = cli()
+        .arg("repair")
+        .arg(&archive)
+        .env_remove("PACKRAT_PASSWORD")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let fixed = dir.path().join("vault.repaired.prat");
+    assert!(
+        fs::read(&fixed).unwrap() == bytes,
+        "the repaired archive differs from the original"
+    );
+    let dest = dir.path().join("out");
+    fs::create_dir(&dest).unwrap();
+    let out = cli()
+        .arg("extract")
+        .arg(&fixed)
+        .arg("-o")
+        .arg(&dest)
+        .env("PACKRAT_PASSWORD", "pw 123 ключ")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(
+        fs::read_to_string(dest.join("vault/a.txt")).unwrap(),
+        "classified ".repeat(2000)
+    );
+}

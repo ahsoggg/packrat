@@ -509,7 +509,14 @@ fn repair_into(src: &Path, dst: &Path) -> Result<RepairReport> {
 
     // the result must open as an archive
     let src_check = std::sync::Arc::new(FileSource::open(dst)?);
-    super::read::PratArchive::from_source(src_check)?;
+    match super::read::PratArchive::from_source(src_check.clone()) {
+        Ok(_) => {}
+        // an encrypted archive cannot be opened without its password, and repair does not ask for one
+        Err(Error::PasswordRequired) => {
+            super::read::PratArchive::check_framing(&(src_check as crate::source::SharedSource))?
+        }
+        Err(e) => return Err(e),
+    }
     Ok(report)
 }
 

@@ -1,4 +1,4 @@
-# The `.prat` format, version 1
+# The `.prat` format, versions 1 and 2
 
 `.prat` is Packrat's own archive format. It exists for what ZIP, 7z and RAR cannot do together: store repeated
 data once, open a single file without decoding everything before it, and detect any damaged byte.
@@ -23,7 +23,9 @@ Footer (68 bytes)
 | 8 | 2 | version (1) |
 | 10 | 6 | reserved, zero |
 
-A reader refuses a version it does not know, with a message that says so.
+Version 1 is a plain archive. Version 2 is an encrypted one (see *Encryption*): an older Packrat that knows only
+version 1 refuses it with a message that says so instead of misreading ciphertext. A reader refuses any version it
+does not know.
 
 ### Block
 
@@ -108,6 +110,54 @@ Opening an archive reads the header, the footer and the index. Extracting one fi
 chunks. Decoded blocks are kept in a small cache shared by all threads; threads that need the same block wait for
 one decode instead of repeating it.
 
+## Encryption (version 2)
+
+An archive made with a password is version 2. Right after the 16-byte file header comes the **encryption header**
+(80 bytes), and the first block follows it.
+
+| offset | size | |
+|---|---|---|
+| 0 | 8 | magic `PRATENC\x01` |
+| 8 | 1 | key derivation: 1 = Argon2id (v1.3) |
+| 9 | 1 | cipher: 1 = XChaCha20-Poly1305 |
+| 12 | 4 | Argon2 memory in KiB |
+| 16 | 4 | Argon2 passes |
+| 20 | 4 | Argon2 lanes |
+| 24 | 16 | salt (random) |
+| 40 | 16 | nonce prefix (random) |
+| 56 | 16 | password check |
+| 76 | 4 | CRC-32 of bytes 0..76 |
+
+**Keys.** `Argon2id(password as UTF-8, salt, memory, passes, lanes)` gives 32 bytes, from which four independent keys are
+derived with BLAKE3 `derive_key` under four different context strings: blocks, index, block hashes, password check.
+The password check is the first 16 bytes of the keyed BLAKE3 hash of a fixed string under the check key; it lets a
+wrong password be told from a damaged archive. A reader refuses settings outside memory 8 KiB to 1 GiB (and at least
+8 KiB per lane), 1 to 32 passes and 1 to 16 lanes *before* doing any work, so a hostile file cannot make opening it
+expensive. The defaults are 64 MiB, 3 passes and 4 lanes.
+
+**Sealing.** Blocks and the index are sealed with XChaCha20-Poly1305 after compression. The nonce is the 16-byte prefix
+followed by the block number (the index uses the number 2^64 - 1, which no block has), so no nonce repeats within an
+archive and the prefix is random per archive. The associated data is the BLAKE3 hash of the whole encryption header,
+a kind byte (block or index), the block number, the codec and the uncompressed length. As a result a block cannot be
+moved to another position, given another codec or size, or taken into another archive, and changing any field of the
+encryption header (even one the key derivation ignores) makes every block fail.
+
+**What changes in the rest of the format.**
+
+- `clen` of a block is the length of the ciphertext, which is 16 bytes (the tag) longer than the compressed data.
+- The 32-byte hash in the block header is a *keyed* BLAKE3 hash under the hash key. A plain hash of the plaintext would
+  let anyone who has a candidate file confirm that it is in the archive.
+- The stored index is the sealed index. After decryption it is compressed or raw as in version 1 (its length tells which).
+  The footer's hash covers the sealed bytes, so it can be checked without the password. Names, sizes, times, chunk
+  hashes and the file list are all inside the index, hence encrypted; a separate switch for hiding names does not exist.
+- Recovery data (below) protects the ciphertext. Checking and repairing an archive therefore needs no password.
+
+**What stays visible:** the size of the file, the number of blocks and their sizes and codec, the length of the index and
+the encryption settings. Compression happens before encryption, so the size of a block reveals how well its content
+compresses. Deduplication works as before, inside the encrypted index. There is no protection against someone replacing
+the whole file with an older valid archive of yours, and nothing signs an archive: this is encryption with integrity,
+not authorship.
+
 ## Recovery data (optional)
 
 `--recovery PCT` appends Reed-Solomon recovery data between the index and the footer. It protects everything
@@ -137,12 +187,11 @@ there are intact parity shards, nothing is written and the error says so.
 Repair holds the protected bytes and the decoder's work area in memory; archives above 3 GiB are refused for that
 reason.
 
-## Not in version 1 yet
+## Not implemented yet
 
 Planned as additions that older readers can tell apart (new codec ids, new flag bits, a version bump where the
 layout changes):
 
-- encryption (Argon2id key derivation, authenticated encryption, encrypted names and index);
 - multi-volume archives;
 - other block codecs (LZMA2) and filters (BCJ) per block;
 - NTFS metadata (attributes, streams, ACLs) and links;

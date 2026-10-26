@@ -2,16 +2,19 @@
 //! referenced, new chunks are collected into blocks of several MiB that are compressed on worker threads, and the
 //! index goes at the end.
 
+use super::crypto::{Cipher, ENC_HEADER_LEN, KdfParams};
 use super::format::*;
 use crate::codec::zstd::zstd_level;
 use crate::error::{Error, Result};
 use crate::input::InputItem;
+use crate::options::Password;
 use crate::par::OrderedPool;
 use crate::progress::Progress;
 use fastcdc::v2020::{FastCDC, StreamCDC};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufWriter, Read, Write};
+use std::sync::Arc;
 
 /// Files up to this size are read whole and cut in memory; bigger ones are streamed.
 const IN_MEMORY_LIMIT: u64 = 64 << 20;
@@ -27,6 +30,9 @@ pub struct PratOptions {
     pub min_chunk: u32,
     pub avg_chunk: u32,
     pub max_chunk: u32,
+    /// Encrypt blocks, names and the index (XChaCha20-Poly1305, key from Argon2id).
+    pub password: Option<Password>,
+    pub kdf: KdfParams,
 }
 
 impl Default for PratOptions {
@@ -38,6 +44,8 @@ impl Default for PratOptions {
             min_chunk: 16 << 10,
             avg_chunk: 64 << 10,
             max_chunk: 256 << 10,
+            password: None,
+            kdf: KdfParams::default(),
         }
     }
 }
@@ -57,29 +65,30 @@ struct Packed {
     payload: Vec<u8>,
 }
 
-fn pack_block(raw: Vec<u8>, level: i32) -> Packed {
-    let hash = *blake3::hash(&raw).as_bytes();
+/// Compresses a block and, for an encrypted archive, seals it. `number` is the block's place in the archive.
+fn pack_block(raw: Vec<u8>, level: i32, number: u32, cipher: Option<&Cipher>) -> Result<Packed> {
     let ulen = raw.len() as u32;
-    match zstd::bulk::compress(&raw, level) {
-        Ok(c) if c.len() < raw.len() => Packed {
-            header: BlockHeader {
-                codec: CODEC_ZSTD,
-                clen: c.len() as u32,
-                ulen,
-                hash,
-            },
-            payload: c,
+    let hash = match cipher {
+        Some(c) => c.block_hash(&raw),
+        None => *blake3::hash(&raw).as_bytes(),
+    };
+    let (codec, body) = match zstd::bulk::compress(&raw, level) {
+        Ok(c) if c.len() < raw.len() => (CODEC_ZSTD, c),
+        _ => (CODEC_STORE, raw),
+    };
+    let payload = match cipher {
+        Some(c) => c.seal_block(number, codec, ulen, &body)?,
+        None => body,
+    };
+    Ok(Packed {
+        header: BlockHeader {
+            codec,
+            clen: payload.len() as u32,
+            ulen,
+            hash,
         },
-        _ => Packed {
-            header: BlockHeader {
-                codec: CODEC_STORE,
-                clen: ulen,
-                ulen,
-                hash,
-            },
-            payload: raw,
-        },
-    }
+        payload,
+    })
 }
 
 struct Sink<W: Write> {
@@ -89,7 +98,8 @@ struct Sink<W: Write> {
 }
 
 impl<W: Write> Sink<W> {
-    fn accept(&mut self, p: Packed) -> Result<()> {
+    fn accept(&mut self, p: Result<Packed>) -> Result<()> {
+        let p = p?;
         self.out.write_all(&p.header.encode())?;
         self.out.write_all(&p.payload)?;
         self.blocks.push(BlockRef {
@@ -106,7 +116,8 @@ impl<W: Write> Sink<W> {
 struct Builder<'a, W: Write> {
     opts: &'a PratOptions,
     zstd_level: i32,
-    pool: OrderedPool<Packed>,
+    pool: OrderedPool<Result<Packed>>,
+    cipher: Option<Arc<Cipher>>,
     sink: Sink<W>,
     seen: HashMap<[u8; 32], u32>,
     chunks: Vec<ChunkRef>,
@@ -124,9 +135,13 @@ impl<W: Write> Builder<'_, W> {
         }
         let raw = std::mem::replace(&mut self.cur, Vec::with_capacity(self.opts.block_bytes));
         let level = self.zstd_level;
+        let number = self.submitted;
+        let cipher = self.cipher.clone();
         let sink = &mut self.sink;
         self.pool
-            .submit(move || pack_block(raw, level), &mut |p| sink.accept(p))?;
+            .submit(move || pack_block(raw, level, number, cipher.as_deref()), &mut |p| {
+                sink.accept(p)
+            })?;
         self.submitted += 1;
         self.stats.blocks += 1;
         Ok(())
@@ -200,14 +215,27 @@ pub fn write_prat<W: Write>(out: W, items: &[InputItem], opts: &PratOptions, pro
         items.iter().map(|i| i.size).sum(),
     );
     let mut out = BufWriter::with_capacity(1 << 20, out);
-    out.write_all(&header_bytes())?;
+    let (cipher, data_start) = match &opts.password {
+        Some(p) if p.is_empty() => return Err(Error::Other("the password is empty".into())),
+        Some(p) => {
+            let (cipher, enc_header) = Cipher::create(p.expose(), opts.kdf)?;
+            out.write_all(&header_bytes_for(VERSION_ENCRYPTED))?;
+            out.write_all(&enc_header)?;
+            (Some(Arc::new(cipher)), HEADER_LEN + ENC_HEADER_LEN as u64)
+        }
+        None => {
+            out.write_all(&header_bytes())?;
+            (None, HEADER_LEN)
+        }
+    };
     let mut b = Builder {
         opts,
         zstd_level: zstd_level(opts.level),
         pool: OrderedPool::new(opts.threads)?,
+        cipher,
         sink: Sink {
             out,
-            pos: HEADER_LEN,
+            pos: data_start,
             blocks: Vec::new(),
         },
         seen: HashMap::new(),
@@ -255,10 +283,13 @@ pub fn write_prat<W: Write>(out: W, items: &[InputItem], opts: &PratOptions, pro
         files,
     };
     let raw = index.encode();
-    let stored = match zstd::bulk::compress(&raw, 6) {
+    let mut stored = match zstd::bulk::compress(&raw, 6) {
         Ok(c) if c.len() < raw.len() => c,
         _ => raw.clone(),
     };
+    if let Some(c) = &b.cipher {
+        stored = c.seal_index(raw.len() as u32, &stored)?;
+    }
     let footer = Footer {
         index_offset: b.sink.pos,
         index_clen: stored.len() as u64,

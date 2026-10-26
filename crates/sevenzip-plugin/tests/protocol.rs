@@ -14,6 +14,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc;
 use std::time::Duration;
+use windows_sys::Win32::Foundation::SysAllocStringLen;
 
 type Hr = i32;
 const S_OK: Hr = 0;
@@ -286,6 +287,83 @@ fn callback(archive: *mut c_void) -> Box<FakeCallback> {
     })
 }
 
+// ---- stand-in for 7-Zip's open callback, which offers the password interface ------------------------------------
+
+const IID_CRYPTO_GET_TEXT_PASSWORD: Guid = guid(5, 0x10);
+
+#[repr(C)]
+struct PasswordVtbl {
+    base: Unknown,
+    get_text_password: unsafe extern "system" fn(*mut c_void, *mut *mut u16) -> Hr,
+}
+
+enum Answer {
+    Password(String),
+    Cancel,
+}
+
+#[repr(C)]
+struct FakeOpenCallback {
+    vtbl: *const PasswordVtbl,
+    /// `None` models a callback that has no password interface at all.
+    answer: Option<Answer>,
+    asked: AtomicU32,
+    refs: AtomicU32,
+}
+
+unsafe extern "system" fn p_qi(p: *mut c_void, iid: *const Guid, out: *mut *mut c_void) -> Hr {
+    let me = unsafe { &*(p as *const FakeOpenCallback) };
+    if me.answer.is_some() && unsafe { *iid } == IID_CRYPTO_GET_TEXT_PASSWORD {
+        me.refs.fetch_add(1, Ordering::SeqCst);
+        unsafe { *out = p };
+        S_OK
+    } else {
+        unsafe { *out = null_mut() };
+        E_NOINTERFACE
+    }
+}
+unsafe extern "system" fn p_add_ref(p: *mut c_void) -> u32 {
+    unsafe { &*(p as *const FakeOpenCallback) }
+        .refs
+        .fetch_add(1, Ordering::SeqCst)
+        + 1
+}
+unsafe extern "system" fn p_release(p: *mut c_void) -> u32 {
+    unsafe { &*(p as *const FakeOpenCallback) }
+        .refs
+        .fetch_sub(1, Ordering::SeqCst)
+        - 1
+}
+unsafe extern "system" fn p_get(p: *mut c_void, out: *mut *mut u16) -> Hr {
+    let me = unsafe { &*(p as *const FakeOpenCallback) };
+    me.asked.fetch_add(1, Ordering::SeqCst);
+    match &me.answer {
+        Some(Answer::Password(pw)) => {
+            let wide: Vec<u16> = pw.encode_utf16().collect();
+            unsafe { *out = SysAllocStringLen(wide.as_ptr(), wide.len() as u32) as *mut u16 };
+            S_OK
+        }
+        _ => 0x8000_4004u32 as i32, // E_ABORT: the user cancelled the box
+    }
+}
+static PASSWORD_VTBL: PasswordVtbl = PasswordVtbl {
+    base: Unknown {
+        qi: p_qi,
+        add_ref: p_add_ref,
+        release: p_release,
+    },
+    get_text_password: p_get,
+};
+
+fn open_callback(answer: Option<Answer>) -> Box<FakeOpenCallback> {
+    Box::new(FakeOpenCallback {
+        vtbl: &PASSWORD_VTBL,
+        answer,
+        asked: AtomicU32::new(0),
+        refs: AtomicU32::new(1),
+    })
+}
+
 // ---- helpers ---------------------------------------------------------------------------------------------------
 
 fn noise(n: usize, seed: u64) -> Vec<u8> {
@@ -315,17 +393,32 @@ fn make_archive(dir: &Path) -> (PathBuf, PathBuf) {
     (src, out)
 }
 
+fn make_encrypted(dir: &Path, password: &str) -> PathBuf {
+    let (src, _) = make_archive(dir);
+    let out = dir.join("enc.prat");
+    let mut o = CreateOptions::new(Format::Prat);
+    o.solid_bytes = Some(1 << 20);
+    o.password = Some(packrat_core::Password::new(password));
+    o.kdf_mib = Some(1);
+    create_archive(&out, std::slice::from_ref(&src), &o, &Progress::new()).unwrap();
+    out
+}
+
 struct Opened {
     archive: *mut c_void,
     stream: Box<FakeStream>,
 }
 
 fn open_archive(file: Vec<u8>) -> Result<Opened, Hr> {
+    open_archive_with(file, null_mut())
+}
+
+fn open_archive_with(file: Vec<u8>, open_callback: *mut c_void) -> Result<Opened, Hr> {
     let mut obj: *mut c_void = null_mut();
     assert_eq!(unsafe { CreateObject(&CLSID, &IID_IIN_ARCHIVE, &mut obj) }, S_OK);
     let mut stream = fake_stream(file);
     let sp: *mut c_void = (&mut *stream as *mut FakeStream).cast();
-    let hr = unsafe { (vt::<InArchive>(obj).open)(obj, sp, std::ptr::null(), null_mut()) };
+    let hr = unsafe { (vt::<InArchive>(obj).open)(obj, sp, std::ptr::null(), open_callback) };
     if hr != S_OK {
         unsafe { (vt::<InArchive>(obj).base.release)(obj) };
         return Err(hr);
@@ -617,4 +710,88 @@ fn query_interface_answers_for_the_archive_interface_and_refuses_others() {
     );
     assert!(other.is_null());
     unsafe { (vt::<InArchive>(a).base.release)(a) };
+}
+
+#[test]
+fn an_encrypted_archive_asks_7zip_for_the_password_and_opens_with_the_right_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let arc = make_encrypted(dir.path(), "pässword 密码");
+    let file = fs::read(&arc).unwrap();
+    within(60, move || {
+        let mut cb = open_callback(Some(Answer::Password("pässword 密码".into())));
+        let cp: *mut c_void = (&mut *cb as *mut FakeOpenCallback).cast();
+        let o = open_archive_with(file, cp).expect("the right password opens it");
+        assert_eq!(cb.asked.load(Ordering::SeqCst), 1, "asked exactly once");
+        assert_eq!(
+            cb.refs.load(Ordering::SeqCst),
+            1,
+            "the plugin released the password interface"
+        );
+        let a = o.archive;
+        assert!(items(a) >= 7);
+        // the columns say so: encrypted files, a method that names the cipher
+        let mut enc = 0;
+        for i in 0..items(a) {
+            if prop(a, i, 15).as_bool() == Some(true) {
+                enc += 1;
+                assert_eq!(unsafe { prop(a, i, 22).take_string() }, "PRAT+AEAD");
+            }
+        }
+        assert_eq!(enc, 5, "every file is encrypted, the folders are not");
+        // and the data comes out
+        let mut ecb = callback(a);
+        let ep: *mut c_void = (&mut *ecb as *mut FakeCallback).cast();
+        assert_eq!(
+            unsafe { (vt::<InArchive>(a).extract)(a, std::ptr::null(), u32::MAX, 0, ep) },
+            S_OK
+        );
+        assert!(ecb.results.lock().unwrap().iter().all(|&r| r == 0));
+        // the stand-in hands out a stream for every item, folders included; the files carry the data
+        let sink = ecb.sink.lock().unwrap();
+        assert_eq!(sink.len(), items(a) as usize);
+        assert_eq!(
+            sink.iter().filter(|(_, data)| !data.is_empty()).count(),
+            4,
+            "four files are not empty"
+        );
+        drop(sink);
+        unsafe { (vt::<InArchive>(a).base.release)(a) };
+        drop(o.stream);
+    });
+}
+
+#[test]
+fn a_wrong_password_a_cancelled_box_and_a_missing_callback_all_leave_the_archive_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let arc = make_encrypted(dir.path(), "right");
+    let file = fs::read(&arc).unwrap();
+    within(60, move || {
+        let mut wrong = open_callback(Some(Answer::Password("wrong".into())));
+        let wp: *mut c_void = (&mut *wrong as *mut FakeOpenCallback).cast();
+        assert_eq!(
+            open_archive_with(file.clone(), wp).err(),
+            Some(S_FALSE),
+            "wrong password"
+        );
+        assert_eq!(wrong.asked.load(Ordering::SeqCst), 1);
+
+        let mut cancel = open_callback(Some(Answer::Cancel));
+        let cp: *mut c_void = (&mut *cancel as *mut FakeOpenCallback).cast();
+        assert_eq!(
+            open_archive_with(file.clone(), cp).err(),
+            Some(0x8000_4004u32 as i32),
+            "cancelled"
+        );
+
+        assert_eq!(open_archive(file.clone()).err(), Some(S_FALSE), "no callback to ask");
+
+        let mut none = open_callback(None);
+        let np: *mut c_void = (&mut *none as *mut FakeOpenCallback).cast();
+        assert_eq!(
+            open_archive_with(file, np).err(),
+            Some(S_FALSE),
+            "a callback without a password interface"
+        );
+        assert_eq!(none.refs.load(Ordering::SeqCst), 1);
+    });
 }

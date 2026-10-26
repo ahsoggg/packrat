@@ -2,10 +2,12 @@
 //! the blocks its chunks live in. Decoded blocks are shared between threads through a small cache, so several
 //! files that sit in one block do not decode it again, and two threads that need the same block wait for one decode.
 
+use super::crypto::{Cipher, ENC_HEADER_LEN, TAG_LEN};
 use super::format::*;
 use crate::archive::{Archive, EntryReader, Kind};
 use crate::entry::{Entry, EntryKind};
 use crate::error::{Error, Result};
+use crate::options::OpenOptions;
 use crate::source::{SharedSource, read_exact_at};
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read};
@@ -57,23 +59,45 @@ pub struct PratArchive {
     index: Index,
     entries: Vec<Entry>,
     cache: Cache,
+    cipher: Option<Cipher>,
 }
 
 impl PratArchive {
     pub fn from_source(src: SharedSource) -> Result<Self> {
+        Self::from_source_with(src, &OpenOptions::default())
+    }
+
+    /// `opts.password` is used when the archive is encrypted; without it that is `Error::PasswordRequired`.
+    pub fn from_source_with(src: SharedSource, opts: &OpenOptions) -> Result<Self> {
         let len = src.len();
         if len < HEADER_LEN + FOOTER_LEN as u64 {
             return Err(Error::Corrupt("the file is too short to be a .prat archive".into()));
         }
         let mut head = [0u8; HEADER_LEN as usize];
         read_exact_at(&*src, 0, &mut head)?;
-        check_header(&head)?;
+        let version = check_header(&head)?;
+        let (cipher, data_start) = if version == VERSION_ENCRYPTED {
+            let password = opts.password.as_ref().ok_or(Error::PasswordRequired)?;
+            let mut enc = [0u8; ENC_HEADER_LEN];
+            if len < HEADER_LEN + ENC_HEADER_LEN as u64 + FOOTER_LEN as u64 {
+                return Err(Error::Corrupt(
+                    "the file is too short to be an encrypted .prat archive".into(),
+                ));
+            }
+            read_exact_at(&*src, HEADER_LEN, &mut enc)?;
+            (
+                Some(Cipher::open(&enc, password.expose())?),
+                HEADER_LEN + ENC_HEADER_LEN as u64,
+            )
+        } else {
+            (None, HEADER_LEN)
+        };
         let mut foot = [0u8; FOOTER_LEN];
         read_exact_at(&*src, len - FOOTER_LEN as u64, &mut foot)?;
         let footer = Footer::decode(&foot)?;
 
         let idx_end = footer.index_offset.checked_add(footer.index_clen);
-        if footer.index_offset < HEADER_LEN
+        if footer.index_offset < data_start
             || idx_end.is_none_or(|e| e > len - FOOTER_LEN as u64)
             || footer.index_ulen > MAX_INDEX_ULEN
         {
@@ -84,7 +108,12 @@ impl PratArchive {
         if *blake3::hash(&stored).as_bytes() != footer.index_hash {
             return Err(Error::Corrupt("the index is damaged".into()));
         }
-        let raw = if footer.index_clen == footer.index_ulen {
+        let stored = match &cipher {
+            Some(c) => c.open_index(footer.index_ulen as u32, &stored)?,
+            None => stored,
+        };
+        // the index is stored raw when compressing it did not help; either way its length tells which
+        let raw = if stored.len() as u64 == footer.index_ulen {
             stored
         } else {
             let raw = zstd::bulk::decompress(&stored, footer.index_ulen as usize)
@@ -110,7 +139,8 @@ impl PratArchive {
                 e.size = f.size;
                 e.mtime = f.mtime;
                 e.mode = f.mode;
-                e.method = "PRAT".into();
+                e.method = if cipher.is_some() { "PRAT+AEAD" } else { "PRAT" }.into();
+                e.encrypted = cipher.is_some() && kind == EntryKind::File;
                 e
             })
             .collect();
@@ -121,7 +151,41 @@ impl PratArchive {
             index,
             entries,
             cache,
+            cipher,
         })
+    }
+
+    /// Checks what can be checked without a password: the headers, the footer, and that the stored index is
+    /// intact. Used to confirm a repaired encrypted archive.
+    pub fn check_framing(src: &SharedSource) -> Result<()> {
+        let len = src.len();
+        if len < HEADER_LEN + FOOTER_LEN as u64 {
+            return Err(Error::Corrupt("the file is too short to be a .prat archive".into()));
+        }
+        let mut head = [0u8; HEADER_LEN as usize];
+        read_exact_at(&**src, 0, &mut head)?;
+        let version = check_header(&head)?;
+        let data_start = if version == VERSION_ENCRYPTED {
+            let mut enc = [0u8; ENC_HEADER_LEN];
+            read_exact_at(&**src, HEADER_LEN, &mut enc)?;
+            Cipher::check_header(&enc)?;
+            HEADER_LEN + ENC_HEADER_LEN as u64
+        } else {
+            HEADER_LEN
+        };
+        let mut foot = [0u8; FOOTER_LEN];
+        read_exact_at(&**src, len - FOOTER_LEN as u64, &mut foot)?;
+        let footer = Footer::decode(&foot)?;
+        let end = footer.index_offset.checked_add(footer.index_clen);
+        if footer.index_offset < data_start || end.is_none_or(|e| e > len - FOOTER_LEN as u64) {
+            return Err(Error::Corrupt("the index lies outside the archive".into()));
+        }
+        let mut stored = vec![0u8; footer.index_clen as usize];
+        read_exact_at(&**src, footer.index_offset, &mut stored)?;
+        if *blake3::hash(&stored).as_bytes() != footer.index_hash {
+            return Err(Error::Corrupt("the index is damaged".into()));
+        }
+        Ok(())
     }
 
     pub fn block_count(&self) -> usize {
@@ -141,15 +205,25 @@ impl PratArchive {
         if h.clen != b.clen || h.ulen != b.ulen || h.codec != b.codec {
             return Err(Error::Corrupt(format!("block {id} does not match the index")));
         }
+        if self.cipher.is_some() && (h.clen as usize) < TAG_LEN {
+            return Err(Error::Corrupt(format!("block {id} is too short to be sealed")));
+        }
         let mut payload = vec![0u8; h.clen as usize];
         read_exact_at(&*self.src, b.offset + BLOCK_HEADER_LEN as u64, &mut payload)?;
+        if let Some(c) = &self.cipher {
+            payload = c.open_block(id, h.codec, h.ulen, &payload)?;
+        }
         let data = match h.codec {
             CODEC_STORE => payload,
             CODEC_ZSTD => zstd::bulk::decompress(&payload, h.ulen as usize)
                 .map_err(|e| Error::Corrupt(format!("block {id} cannot be decoded: {e}")))?,
             other => return Err(Error::Unsupported(format!("block compression method {other}"))),
         };
-        if data.len() != h.ulen as usize || *blake3::hash(&data).as_bytes() != h.hash {
+        let hash = match &self.cipher {
+            Some(c) => c.block_hash(&data),
+            None => *blake3::hash(&data).as_bytes(),
+        };
+        if data.len() != h.ulen as usize || hash != h.hash {
             return Err(Error::Corrupt(format!("block {id} is damaged")));
         }
         Ok(data)

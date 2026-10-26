@@ -75,6 +75,8 @@ pub struct CreateOptions {
     pub solid_bytes: Option<u64>,
     /// `.prat` only: spend this percentage of the archive size on recovery data (0 = none).
     pub recovery_percent: u32,
+    /// `.prat` with a password: memory for the key derivation in MiB (`None`: 64).
+    pub kdf_mib: Option<u32>,
 }
 
 impl CreateOptions {
@@ -90,6 +92,7 @@ impl CreateOptions {
             dict_bytes: None,
             solid_bytes: None,
             recovery_percent: 0,
+            kdf_mib: None,
         }
     }
 }
@@ -179,17 +182,16 @@ fn write_to(output: &Path, items: &[InputItem], opts: &CreateOptions, progress: 
             };
             sevenz::write_7z(file, items, &sopts, progress)?;
         }
-        Format::Prat if opts.password.is_some() => {
-            return Err(Error::Unsupported(
-                "encryption is not available in .prat yet: use ZIP or 7z".into(),
-            ));
-        }
         Format::Prat => {
             let mut popts = PratOptions {
                 level: opts.level,
                 threads: opts.threads,
+                password: opts.password.clone(),
                 ..Default::default()
             };
+            if let Some(mb) = opts.kdf_mib {
+                popts.kdf.mem_kib = mb.saturating_mul(1024);
+            }
             if let Some(b) = opts.solid_bytes {
                 popts.block_bytes = usize::try_from(b.clamp(1 << 20, 128 << 20)).unwrap_or(16 << 20);
             }

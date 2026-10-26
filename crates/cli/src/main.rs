@@ -16,7 +16,7 @@ USAGE:
   packrat-cli test <archive> [--sha256] [--threads N] [--encoding NAME] [PASSWORD OPTIONS]
   packrat-cli repair <archive.prat|zip> [-o FIXED]  rebuild damaged areas from the recovery data (the original is kept)
   packrat-cli create <output> <paths...> [--format FMT] [--level N] [--threads N]
-                      [PASSWORD OPTIONS] [--no-encrypt-names] [--no-filters] [--dict-mb N] [--solid-mb N] [--recovery PCT]
+                      [PASSWORD OPTIONS] [--no-encrypt-names] [--no-filters] [--dict-mb N] [--solid-mb N] [--recovery PCT] [--kdf-mb N]
   packrat-cli bench-gen <dir> [--mb N]     write the deterministic data set used by scripts/bench.ps1
   packrat-cli --version | --help
 
@@ -36,6 +36,10 @@ PASSWORD OPTIONS: --ask-password | --password-file FILE | env PACKRAT_PASSWORD
   prat is Packrat's own format: files are cut into content-defined chunks and identical chunks are stored once
   (copies, backups, versions of the same project shrink a lot), blocks are zstd (--level 1-9, --solid-mb sets
   the block size, 1-128, default 16) and every block carries a BLAKE3 hash. Only Packrat opens it for now.
+  prat with a password (--ask-password, --password-file or PACKRAT_PASSWORD) is encrypted: every block and the index
+  (names, sizes, times) are sealed with XChaCha20-Poly1305 under a key from Argon2id; --kdf-mb sets the memory the
+  key derivation uses (default 64 MiB; more makes guessing passwords dearer and opening slower). Repair works
+  without the password.
   --recovery PCT (prat and zip) adds Reed-Solomon recovery data of PCT percent of the archive size: any damaged
   areas up to that amount can be rebuilt with `repair`, which writes a repaired copy and never touches the original.
   A ZIP with recovery data is still an ordinary ZIP: WinRAR, 7-Zip and Explorer open it (they skip the recovery
@@ -82,6 +86,25 @@ impl Args {
         let v = self.0.remove(i + 1);
         self.0.remove(i);
         Ok(Some(v))
+    }
+
+    /// Called once every known option has been taken: an argument that still looks like an option is a mistake, not
+    /// a file name. Silently treating `--password secret` as a file to archive would produce an unprotected archive.
+    fn reject_unknown(&self) -> Result<(), String> {
+        let Some(bad) = self
+            .0
+            .iter()
+            .find(|a| a.len() > 1 && a.starts_with('-') && !std::path::Path::new(a.as_str()).exists())
+        else {
+            return Ok(());
+        };
+        if bad.to_ascii_lowercase().contains("pass") {
+            return Err(format!(
+                "unknown option '{bad}': passwords are never taken from the command line; use --ask-password, \
+                 --password-file FILE or the PACKRAT_PASSWORD environment variable"
+            ));
+        }
+        Err(format!("unknown option '{bad}' (see --help)"))
     }
 
     fn number(&mut self, names: &[&str]) -> Result<Option<usize>, String> {
@@ -208,6 +231,7 @@ fn open_archive(path: &str, opts: &OpenOptions) -> Result<Box<dyn Archive>, Stri
 
 fn cmd_list(mut args: Args) -> Result<u8, String> {
     let oo = open_options(&mut args)?;
+    args.reject_unknown()?;
     let path = args.0.first().cloned().ok_or("list: archive path is missing")?;
     let a = open_archive(&path, &oo)?;
     if let Some(l) = a.legacy_names() {
@@ -268,6 +292,7 @@ fn cmd_extract(mut args: Args) -> Result<u8, String> {
     }
     let out = args.value(&["-o", "--output"])?.unwrap_or_else(|| ".".into());
     let threads = args.number(&["--threads", "-j"])?.unwrap_or(0);
+    args.reject_unknown()?;
     let path = args.0.first().cloned().ok_or("extract: archive path is missing")?;
     let wanted: Vec<String> = args.0.iter().skip(1).map(|s| s.replace('\\', "/")).collect();
 
@@ -357,6 +382,7 @@ fn cmd_create(mut args: Args) -> Result<u8, String> {
     let no_filters = args.flag("--no-filters");
     let dict_mb = args.number(&["--dict-mb"])?;
     let recovery = args.number(&["--recovery"])?;
+    let kdf_mb = args.number(&["--kdf-mb"])?;
     let solid_mb = args.number(&["--solid-mb"])?;
     let oo = open_options(&mut args)?;
     let format_name = args.value(&["--format", "-f"])?;
@@ -366,6 +392,7 @@ fn cmd_create(mut args: Args) -> Result<u8, String> {
         return Err("create: need an output file and at least one path".into());
     }
     let output = PathBuf::from(args.0.remove(0));
+    args.reject_unknown()?;
     let inputs: Vec<PathBuf> = args.0.iter().map(PathBuf::from).collect();
 
     let lower = output.to_string_lossy().to_ascii_lowercase();
@@ -393,6 +420,9 @@ fn cmd_create(mut args: Args) -> Result<u8, String> {
             Some(u32::try_from(mb.saturating_mul(1 << 20)).map_err(|_| "--dict-mb is too large (the limit is 1023)")?);
     }
     opts.solid_bytes = solid_mb.map(|mb| (mb as u64).saturating_mul(1 << 20));
+    opts.kdf_mib = kdf_mb
+        .map(|mb| u32::try_from(mb).map_err(|_| "--kdf-mb is too large (the limit is 1024)"))
+        .transpose()?;
     opts.recovery_percent =
         u32::try_from(recovery.unwrap_or(0)).map_err(|_| "--recovery is a percentage from 1 to 100")?;
 
@@ -514,6 +544,7 @@ fn cmd_bench_gen(mut args: Args) -> Result<u8, String> {
 
 fn cmd_repair(mut args: Args) -> Result<u8, String> {
     let out = args.value(&["-o", "--output"])?;
+    args.reject_unknown()?;
     let path = args.0.first().cloned().ok_or("repair: archive path is missing")?;
     let src = PathBuf::from(&path);
     let dst = match out {
@@ -577,6 +608,7 @@ fn cmd_test(mut args: Args) -> Result<u8, String> {
     let oo = open_options(&mut args)?;
     let sha = args.flag("--sha256");
     let threads = args.number(&["--threads", "-j"])?.unwrap_or(0);
+    args.reject_unknown()?;
     let path = args.0.first().cloned().ok_or("test: archive path is missing")?;
     let a = open_archive(&path, &oo)?;
     let started = std::time::Instant::now();

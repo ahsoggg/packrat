@@ -5,7 +5,10 @@
 use crate::error::{Error, Result};
 
 pub const MAGIC: [u8; 8] = *b"PRAT\r\n\x1a\n";
+/// Plain archives are version 1 so that every reader can open them; encrypted ones are version 2, which an older
+/// reader refuses with a clear message instead of misreading ciphertext.
 pub const VERSION: u16 = 1;
+pub const VERSION_ENCRYPTED: u16 = 2;
 pub const HEADER_LEN: u64 = 16;
 
 pub const BLOCK_SYNC: [u8; 4] = *b"PrBk";
@@ -29,23 +32,28 @@ fn corrupt<T>(msg: impl Into<String>) -> Result<T> {
 }
 
 pub fn header_bytes() -> [u8; HEADER_LEN as usize] {
+    header_bytes_for(VERSION)
+}
+
+pub fn header_bytes_for(version: u16) -> [u8; HEADER_LEN as usize] {
     let mut h = [0u8; HEADER_LEN as usize];
     h[..8].copy_from_slice(&MAGIC);
-    h[8..10].copy_from_slice(&VERSION.to_le_bytes());
+    h[8..10].copy_from_slice(&version.to_le_bytes());
     h
 }
 
-pub fn check_header(h: &[u8]) -> Result<()> {
+/// Checks the magic and the version and returns the version.
+pub fn check_header(h: &[u8]) -> Result<u16> {
     if h.len() < HEADER_LEN as usize || h[..8] != MAGIC {
         return corrupt("not a .prat file");
     }
     let version = u16::from_le_bytes([h[8], h[9]]);
-    if version == 0 || version > VERSION {
+    if version == 0 || version > VERSION_ENCRYPTED {
         return Err(Error::Unsupported(format!(
-            "this .prat file is version {version}; this Packrat reads up to version {VERSION}"
+            "this .prat file is version {version}; this Packrat reads up to version {VERSION_ENCRYPTED}"
         )));
     }
-    Ok(())
+    Ok(version)
 }
 
 /// Header in front of every block's payload. It is complete on its own, so a damaged index can be rebuilt by
