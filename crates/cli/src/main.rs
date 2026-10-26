@@ -1,5 +1,6 @@
 use packrat_core::create::{CreateOptions, Format, create_archive};
 use packrat_core::encoding::NameEncoding;
+use packrat_core::mask::Masks;
 use packrat_core::extract::{self, ExtractOptions, Resolution};
 use packrat_core::{Archive, EntryKind, OpenOptions, Password, Progress, open, timeutil};
 use std::path::PathBuf;
@@ -9,22 +10,34 @@ const HELP: &str = "\
 packrat-cli — Packrat archive tool
 
 USAGE:
-  packrat-cli list <archive> [--encoding NAME] [PASSWORD OPTIONS]
-  packrat-cli extract <archive> [NAMES...] [-o DIR] [--smart] [--threads N]
+  packrat-cli list <archive> [NAMES/MASKS...] [-i MASK] [-x MASK] [--encoding NAME] [PASSWORD OPTIONS]
+  packrat-cli extract <archive> [NAMES/MASKS...] [-o DIR] [--smart] [--threads N] [-i MASK] [-x MASK] [--stdout]
                       [--skip | --overwrite | --keep-both] [--accept-risks] [--repair]
                       [--encoding NAME] [PASSWORD OPTIONS]
   packrat-cli test <archive> [--sha256] [--threads N] [--encoding NAME] [PASSWORD OPTIONS]
   packrat-cli repair <archive.prat|zip> [-o FIXED]  rebuild damaged areas from the recovery data (the original is kept)
-  packrat-cli create <output> <paths...> [--format FMT] [--level N] [--threads N]
+  packrat-cli create <output> <paths...> [--format FMT] [--level N] [--threads N] [-i MASK] [-x MASK]
+                      [--no-recursion] [--delete-source] [--stdin NAME]
                       [PASSWORD OPTIONS] [--no-encrypt-names] [--no-filters] [--dict-mb N] [--solid-mb N] [--recovery PCT] [--kdf-mb N]
+  packrat-cli hash <files...> [--algo crc32|sha1|sha256|blake3]   checksums of files
+  packrat-cli bench [--mb N]               speed of the compressors on generated data in memory (default 16 MiB)
   packrat-cli bench-gen <dir> [--mb N]     write the deterministic data set used by scripts/bench.ps1
   packrat-cli --version | --help
 
 FORMATS (create): zip (deflate), zip-zstd, zip-store, 7z, prat, tar, tar.gz, tar.zst, tar.xz, tar.lz4
   The format is taken from the output extension when --format is not given.
 
+MASKS AND LISTS:
+  -i MASK / -x MASK (also --include / --exclude, and 7-Zip's -i!MASK / -x!MASK) keep or leave out files by name;
+  repeat them as needed. * is any run of characters, ? one character; a mask without / is tried against every
+  folder and file name on the path (`-x node_modules`, `-i *.rs`), a mask with / against the path from the
+  archive root. Case is ignored. An argument @FILE is replaced by the lines of FILE (one path or name per line).
+  --no-recursion (7-Zip's -r-) adds only the files directly inside the given folders; --delete-source (-sdel)
+  deletes the added files after the archive was written. --stdin NAME stores what arrives on standard input as
+  the file NAME; extract --stdout (-so) writes the contents of the chosen files to standard output.
+
 EXTRACT:
-  --smart      one root folder goes straight to the target, one file lands next to it,
+  --smart     one root folder goes straight to the target, one file lands next to it,
                loose items get a folder named after the archive
   existing files are skipped unless --overwrite or --keep-both is given
 
@@ -107,6 +120,15 @@ impl Args {
         Err(format!("unknown option '{bad}' (see --help)"))
     }
 
+    /// Every occurrence of an option that may be repeated.
+    fn values(&mut self, names: &[&str]) -> Result<Vec<String>, String> {
+        let mut out = Vec::new();
+        while let Some(v) = self.value(names)? {
+            out.push(v);
+        }
+        Ok(out)
+    }
+
     fn number(&mut self, names: &[&str]) -> Result<Option<usize>, String> {
         self.value(names)?
             .map(|v| {
@@ -115,6 +137,88 @@ impl Args {
             })
             .transpose()
     }
+}
+
+/// 7-Zip spellings become ours (`-i!*.rs` -> `-i *.rs`, `-r-`, `-sdel`, `-so`) and `@FILE` arguments are replaced by
+/// the lines of the file.
+fn normalize_args(args: &mut Args) -> Result<(), String> {
+    let mut out = Vec::with_capacity(args.0.len());
+    let mut past_options = false;
+    for a in args.0.drain(..) {
+        if a == "--" && !past_options {
+            past_options = true;
+            continue;
+        }
+        if !past_options {
+            let lower = a.to_ascii_lowercase();
+            let mapped = ["-ir!", "-xr!", "-i!", "-x!"].iter().find(|p| lower.starts_with(*p));
+            if let Some(p) = mapped {
+                out.push(if p.starts_with("-i") { "-i" } else { "-x" }.to_owned());
+                out.push(a[p.len()..].to_owned());
+                continue;
+            }
+            let long = match a.as_str() {
+                "-r-" => Some("--no-recursion"),
+                "-sdel" => Some("--delete-source"),
+                "-so" => Some("--stdout"),
+                _ => None,
+            };
+            if let Some(l) = long {
+                out.push(l.to_owned());
+                continue;
+            }
+        }
+        match a.strip_prefix('@') {
+            Some(file) if !file.is_empty() => {
+                let text = std::fs::read_to_string(file).map_err(|e| format!("{file}: {e}"))?;
+                for line in text.lines() {
+                    let line = line.trim().trim_matches('"');
+                    if !line.is_empty() {
+                        out.push(line.to_owned());
+                    }
+                }
+            }
+            _ => out.push(a),
+        }
+    }
+    args.0 = out;
+    Ok(())
+}
+
+/// `-i` and `-x` masks (repeatable).
+fn take_masks(args: &mut Args) -> Result<Masks, String> {
+    let mut m = Masks::new();
+    for i in args.values(&["-i", "--include"])? {
+        m.include(&i);
+    }
+    for x in args.values(&["-x", "--exclude"])? {
+        m.exclude(&x);
+    }
+    Ok(m)
+}
+
+/// Entries chosen by names (an exact file or folder, or a mask when the name holds `*` or `?`) and by the masks.
+fn select_entries(a: &dyn Archive, wanted: &[String], masks: &Masks) -> Vec<usize> {
+    let mut by_mask = Masks::new();
+    let mut plain = Vec::new();
+    for w in wanted {
+        if w.contains('*') || w.contains('?') {
+            by_mask.include(w);
+        } else {
+            plain.push(w.replace('\\', "/").trim_end_matches('/').to_owned());
+        }
+    }
+    a.entries()
+        .iter()
+        .filter(|e| {
+            let p = e.path.replace('\\', "/");
+            let named = wanted.is_empty()
+                || (by_mask.has_include() && by_mask.allows(&p))
+                || plain.iter().any(|w| p.trim_end_matches('/') == w || p.starts_with(&format!("{w}/")));
+            named && masks.allows(&p)
+        })
+        .map(|e| e.index)
+        .collect()
 }
 
 fn human(n: u64) -> String {
@@ -146,6 +250,10 @@ fn main() -> ExitCode {
         println!("packrat-cli {}", env!("CARGO_PKG_VERSION"));
         return ExitCode::SUCCESS;
     }
+    if let Err(m) = normalize_args(&mut args) {
+        eprintln!("packrat-cli: {m}");
+        return ExitCode::from(2);
+    }
     let cmd = args.0.remove(0);
     let result = match cmd.as_str() {
         "list" | "l" => cmd_list(args),
@@ -153,6 +261,8 @@ fn main() -> ExitCode {
         "create" | "c" | "a" => cmd_create(args),
         "repair" => cmd_repair(args),
         "test" | "t" => cmd_test(args),
+        "hash" | "h" => cmd_hash(args),
+        "bench" | "b" => cmd_bench(args),
         "bench-gen" => cmd_bench_gen(args),
         other => Err(format!("unknown command '{other}' (see --help)")),
     };
@@ -231,9 +341,12 @@ fn open_archive(path: &str, opts: &OpenOptions) -> Result<Box<dyn Archive>, Stri
 
 fn cmd_list(mut args: Args) -> Result<u8, String> {
     let oo = open_options(&mut args)?;
+    let masks = take_masks(&mut args)?;
     args.reject_unknown()?;
     let path = args.0.first().cloned().ok_or("list: archive path is missing")?;
+    let wanted: Vec<String> = args.0.iter().skip(1).cloned().collect();
     let a = open_archive(&path, &oo)?;
+    let shown: std::collections::HashSet<usize> = select_entries(&*a, &wanted, &masks).into_iter().collect();
     if let Some(l) = a.legacy_names() {
         eprintln!(
             "note: {} names have no encoding information; decoded as {} (detected: {}). Use --encoding to change.",
@@ -248,7 +361,7 @@ fn cmd_list(mut args: Args) -> Result<u8, String> {
     println!("{} — {}", path, a.kind().label());
     println!("{:>12} {:>12}  {:<16}  Name", "Size", "Packed", "Modified");
     let (mut files, mut dirs, mut size, mut packed) = (0u64, 0u64, 0u64, 0u64);
-    for e in a.entries() {
+    for e in a.entries().iter().filter(|e| shown.contains(&e.index)) {
         let date = e.mtime.map(timeutil::format_minutes).unwrap_or_default();
         let (s, p) = match e.kind {
             EntryKind::Dir => {
@@ -292,11 +405,16 @@ fn cmd_extract(mut args: Args) -> Result<u8, String> {
     }
     let out = args.value(&["-o", "--output"])?.unwrap_or_else(|| ".".into());
     let threads = args.number(&["--threads", "-j"])?.unwrap_or(0);
+    let to_stdout = args.flag("--stdout");
+    let masks = take_masks(&mut args)?;
     args.reject_unknown()?;
     let path = args.0.first().cloned().ok_or("extract: archive path is missing")?;
-    let wanted: Vec<String> = args.0.iter().skip(1).map(|s| s.replace('\\', "/")).collect();
+    let wanted: Vec<String> = args.0.iter().skip(1).cloned().collect();
 
     let a = open_archive(&path, &oo)?;
+    if to_stdout {
+        return extract_to_stdout(&*a, &wanted, &masks);
+    }
     let name = PathBuf::from(&path)
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -320,20 +438,10 @@ fn cmd_extract(mut args: Args) -> Result<u8, String> {
     } else {
         Resolution::Skip
     };
-    if !wanted.is_empty() {
-        let sel: Vec<usize> = a
-            .entries()
-            .iter()
-            .filter(|e| {
-                let p = e.path.replace('\\', "/");
-                wanted
-                    .iter()
-                    .any(|w| p == *w || p.starts_with(&format!("{}/", w.trim_end_matches('/'))))
-            })
-            .map(|e| e.index)
-            .collect();
+    if !wanted.is_empty() || !masks.is_empty() {
+        let sel = select_entries(&*a, &wanted, &masks);
         if sel.is_empty() {
-            return Err("none of the given names is in the archive".into());
+            return Err("nothing in the archive matches the given names and masks".into());
         }
         opts.selection = Some(sel);
     }
@@ -377,6 +485,42 @@ fn cmd_extract(mut args: Args) -> Result<u8, String> {
     ))
 }
 
+/// `extract --stdout`: the contents of the chosen files, one after another, on standard output.
+fn extract_to_stdout(a: &dyn Archive, wanted: &[String], masks: &Masks) -> Result<u8, String> {
+    use std::io::Write;
+    let sel: std::collections::HashSet<usize> = select_entries(a, wanted, masks).into_iter().collect();
+    if sel.is_empty() {
+        return Err("nothing in the archive matches the given names and masks".into());
+    }
+    let mut out = std::io::BufWriter::with_capacity(256 << 10, std::io::stdout().lock());
+    let mut failed = false;
+    a.walk(
+        &mut |e| sel.contains(&e.index) && matches!(e.kind, EntryKind::File),
+        &mut |e, r| {
+            if let Err(err) = std::io::copy(r, &mut out) {
+                eprintln!("FAILED {}: {err}", e.path);
+                failed = true;
+            }
+            Ok(())
+        },
+    )
+    .map_err(|e| e.to_string())?;
+    out.flush().map_err(|e| e.to_string())?;
+    Ok(u8::from(failed))
+}
+
+/// Removes `dir` and the empty folders below it.
+fn prune_empty(dir: &std::path::Path) {
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten() {
+            if e.file_type().is_ok_and(|t| t.is_dir()) {
+                prune_empty(&e.path());
+            }
+        }
+    }
+    let _ = std::fs::remove_dir(dir);
+}
+
 fn cmd_create(mut args: Args) -> Result<u8, String> {
     let no_names = args.flag("--no-encrypt-names");
     let no_filters = args.flag("--no-filters");
@@ -388,12 +532,31 @@ fn cmd_create(mut args: Args) -> Result<u8, String> {
     let format_name = args.value(&["--format", "-f"])?;
     let level = args.number(&["--level", "-l"])?;
     let threads = args.number(&["--threads", "-j"])?.unwrap_or(0);
-    if args.0.len() < 2 {
+    let no_recursion = args.flag("--no-recursion");
+    let delete_source = args.flag("--delete-source");
+    let stdin_name = args.value(&["--stdin"])?;
+    let masks = take_masks(&mut args)?;
+    if args.0.is_empty() || (args.0.len() < 2 && stdin_name.is_none()) {
         return Err("create: need an output file and at least one path".into());
     }
     let output = PathBuf::from(args.0.remove(0));
     args.reject_unknown()?;
-    let inputs: Vec<PathBuf> = args.0.iter().map(PathBuf::from).collect();
+    let mut inputs: Vec<PathBuf> = args.0.iter().map(PathBuf::from).collect();
+    let spool = match &stdin_name {
+        Some(name) => {
+            if name.is_empty() || name.contains(['/', '\\']) {
+                return Err("--stdin NAME: the name must be a plain file name".into());
+            }
+            let dir = std::env::temp_dir().join(format!("packrat-stdin-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+            let file = dir.join(name);
+            let mut f = std::fs::File::create(&file).map_err(|e| e.to_string())?;
+            std::io::copy(&mut std::io::stdin().lock(), &mut f).map_err(|e| e.to_string())?;
+            inputs.push(file);
+            Some(dir)
+        }
+        None => None,
+    };
 
     let lower = output.to_string_lossy().to_ascii_lowercase();
     let format = match format_name {
@@ -411,6 +574,8 @@ fn cmd_create(mut args: Args) -> Result<u8, String> {
         opts.level = l.clamp(1, 9) as u32;
     }
     opts.threads = threads;
+    opts.masks = masks;
+    opts.recursive = !no_recursion;
     opts.password = oo.password;
     opts.encrypt_names = !no_names;
     opts.smart = !no_filters;
@@ -427,7 +592,11 @@ fn cmd_create(mut args: Args) -> Result<u8, String> {
         u32::try_from(recovery.unwrap_or(0)).map_err(|_| "--recovery is a percentage from 1 to 100")?;
 
     let started = std::time::Instant::now();
-    let report = create_archive(&output, &inputs, &opts, &Progress::new()).map_err(|e| e.to_string())?;
+    let created = create_archive(&output, &inputs, &opts, &Progress::new());
+    if let Some(dir) = &spool {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+    let report = created.map_err(|e| e.to_string())?;
     let secs = started.elapsed().as_secs_f64();
     println!(
         "{}: {} entries, {} -> {} in {secs:.2} s",
@@ -438,6 +607,24 @@ fn cmd_create(mut args: Args) -> Result<u8, String> {
     );
     for (p, why) in &report.skipped {
         eprintln!("skipped {}: {why}", p.display());
+    }
+    if delete_source {
+        if !report.skipped.is_empty() {
+            eprintln!("--delete-source: some paths were skipped, nothing was deleted");
+            return Ok(1);
+        }
+        let mut removed = 0usize;
+        let spooled = spool.as_deref();
+        for f in report.added.iter().filter(|f| !spooled.is_some_and(|d| f.starts_with(d))) {
+            match std::fs::remove_file(f) {
+                Ok(()) => removed += 1,
+                Err(e) => eprintln!("cannot delete {}: {e}", f.display()),
+            }
+        }
+        for d in inputs.iter().filter(|p| p.is_dir()) {
+            prune_empty(d);
+        }
+        println!("deleted {removed} source files");
     }
     Ok(u8::from(!report.skipped.is_empty()))
 }
@@ -630,4 +817,127 @@ fn cmd_test(mut args: Args) -> Result<u8, String> {
         println!("SHA-256 {hash}");
     }
     Ok(u8::from(!report.is_clean()))
+}
+
+fn cmd_hash(mut args: Args) -> Result<u8, String> {
+    use std::io::Read;
+    let algo = args
+        .value(&["--algo", "-a"])?
+        .unwrap_or_else(|| "sha256".into())
+        .to_ascii_lowercase();
+    args.reject_unknown()?;
+    if args.0.is_empty() {
+        return Err("hash: give at least one file".into());
+    }
+    if !["crc32", "sha1", "sha256", "blake3"].contains(&algo.as_str()) {
+        return Err(format!("unknown algorithm '{algo}' (crc32, sha1, sha256, blake3)"));
+    }
+    let mut failed = false;
+    for path in &args.0 {
+        let mut f = match std::fs::File::open(path) {
+            Ok(f) => f,
+            Err(e) => {
+                eprintln!("{path}: {e}");
+                failed = true;
+                continue;
+            }
+        };
+        let mut crc = crc32fast::Hasher::new();
+        let mut s1 = <sha1::Sha1 as sha1::Digest>::new();
+        let mut s256 = <sha2::Sha256 as sha2::Digest>::new();
+        let mut b3 = blake3::Hasher::new();
+        let mut buf = vec![0u8; 1 << 20];
+        loop {
+            let n = f.read(&mut buf).map_err(|e| format!("{path}: {e}"))?;
+            if n == 0 {
+                break;
+            }
+            match algo.as_str() {
+                "crc32" => crc.update(&buf[..n]),
+                "sha1" => sha1::Digest::update(&mut s1, &buf[..n]),
+                "sha256" => sha2::Digest::update(&mut s256, &buf[..n]),
+                _ => {
+                    b3.update(&buf[..n]);
+                }
+            }
+        }
+        let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+        let digest = match algo.as_str() {
+            "crc32" => format!("{:08x}", crc.finalize()),
+            "sha1" => hex(&sha1::Digest::finalize(s1)),
+            "sha256" => hex(&sha2::Digest::finalize(s256)),
+            _ => b3.finalize().to_hex().to_string(),
+        };
+        println!("{digest}  {path}");
+    }
+    Ok(u8::from(failed))
+}
+
+/// Speed and ratio of each compressor on one generated data set held in memory; nothing touches the disk.
+fn cmd_bench(mut args: Args) -> Result<u8, String> {
+    use packrat_core::codec::stream::{Compression, writer};
+    use std::io::Write;
+    let mb = args.number(&["--mb"])?.unwrap_or(16).clamp(1, 512);
+    let threads = args.number(&["--threads", "-j"])?.unwrap_or(0);
+    args.reject_unknown()?;
+    // mostly text-like with repeats and some binary runs: roughly what source trees look like
+    let mut data = Vec::with_capacity(mb << 20);
+    let mut x = 0x9E37_79B9_7F4A_7C15u64;
+    let words = [
+        "fn", "let", "match", "struct", "impl", "return", "pub", "use", "self", "Result", "Vec", "String",
+    ];
+    while data.len() < mb << 20 {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        data.extend_from_slice(words[(x % words.len() as u64) as usize].as_bytes());
+        data.push(if x & 0x70 == 0 { b'\n' } else { b' ' });
+        if x & 0xFFF == 0 {
+            data.extend((0..64u32).map(|i| (x >> (i % 8)) as u8));
+        }
+    }
+    data.truncate(mb << 20);
+    println!("{:<8} {:>10} {:>8} {:>10}", "codec", "size", "ratio", "MiB/s");
+    for (name, c) in [
+        ("lz4", Compression::Lz4),
+        ("zstd", Compression::Zst),
+        ("gzip", Compression::Gz),
+        ("xz", Compression::Xz),
+    ] {
+        let sink = CountingSink::default();
+        let t = std::time::Instant::now();
+        let mut w = writer(c, sink.clone(), 5, threads).map_err(|e| e.to_string())?;
+        w.write_all(&data).map_err(|e| e.to_string())?;
+        w.finish().map_err(|e| e.to_string())?;
+        let secs = t.elapsed().as_secs_f64().max(1e-6);
+        let size = sink.len();
+        println!(
+            "{name:<8} {:>10} {:>7.1}% {:>10.1}",
+            human(size as u64),
+            size as f64 * 100.0 / data.len() as f64,
+            mb as f64 / secs
+        );
+    }
+    Ok(0)
+}
+
+/// A `Write + Send + 'static` that keeps only the number of bytes written.
+#[derive(Clone, Default)]
+struct CountingSink(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+impl CountingSink {
+    fn len(&self) -> usize {
+        self.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+impl std::io::Write for CountingSink {
+    fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+        self.0.fetch_add(b.len(), std::sync::atomic::Ordering::Relaxed);
+        Ok(b.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }

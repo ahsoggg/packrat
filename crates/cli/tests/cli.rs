@@ -360,3 +360,69 @@ fn encrypted_prat_roundtrips_through_the_cli_and_repairs_without_a_password() {
         "classified ".repeat(2000)
     );
 }
+
+#[test]
+fn masks_listfiles_stdout_hash_and_delete_source() {
+    use std::io::Write;
+    use std::process::Stdio;
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("src");
+    fs::create_dir_all(src.join("node_modules/x")).unwrap();
+    fs::create_dir_all(src.join("sub")).unwrap();
+    fs::write(src.join("a.rs"), "A").unwrap();
+    fs::write(src.join("sub/b.rs"), "B").unwrap();
+    fs::write(src.join("c.log"), "L").unwrap();
+    fs::write(src.join("node_modules/x/i.js"), "N").unwrap();
+    let list = dir.path().join("paths.txt");
+    fs::write(&list, format!("{}\n", src.display())).unwrap();
+
+    // 7-Zip spellings and a list file
+    let zip = dir.path().join("o.zip");
+    let out = cli()
+        .arg("create")
+        .arg(&zip)
+        .arg(format!("@{}", list.display()))
+        .args(["-x!node_modules", "-x", "*.log"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let listing = String::from_utf8_lossy(&cli().arg("list").arg(&zip).output().unwrap().stdout).into_owned();
+    assert!(listing.contains("src/a.rs") && listing.contains("src/sub/b.rs"), "{listing}");
+    assert!(!listing.contains("c.log") && !listing.contains("node_modules"), "{listing}");
+
+    // names with wildcards select, --stdout streams the contents
+    let out = cli().arg("extract").arg(&zip).arg("src/sub/*.rs").arg("-so").output().unwrap();
+    assert_eq!(out.stdout, b"B");
+
+    // only the include mask, no recursion
+    let flat = dir.path().join("flat.zip");
+    assert!(cli().arg("create").arg(&flat).arg(&src).args(["-i", "*.rs", "-r-"]).output().unwrap().status.success());
+    let listing = String::from_utf8_lossy(&cli().arg("list").arg(&flat).output().unwrap().stdout).into_owned();
+    assert!(listing.contains("src/a.rs") && !listing.contains("b.rs"), "{listing}");
+
+    // standard input becomes a file
+    let tgz = dir.path().join("s.tar.gz");
+    let mut child = cli()
+        .arg("create")
+        .arg(&tgz)
+        .args(["--stdin", "note.txt"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(b"from stdin").unwrap();
+    assert!(child.wait().unwrap().success());
+    let out = cli().arg("extract").arg(&tgz).arg("note.txt").arg("-so").output().unwrap();
+    assert_eq!(out.stdout, b"from stdin");
+
+    // hash
+    let out = cli().arg("hash").arg(src.join("a.rs")).args(["--algo", "crc32"]).output().unwrap();
+    assert!(String::from_utf8_lossy(&out.stdout).starts_with("d3d99e8b"), "{:?}", out);
+
+    // --delete-source removes what was added and the folders left empty
+    let gone = dir.path().join("gone.7z");
+    let out = cli().arg("create").arg(&gone).arg(&src).arg("-sdel").output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(!src.exists());
+    assert!(gone.exists());
+}

@@ -2,7 +2,8 @@
 
 use crate::codec::stream::Compression;
 use crate::error::{Error, Result};
-use crate::input::{self, InputItem, Skipped};
+use crate::input::{self, CollectOptions, InputItem, Skipped};
+use crate::mask::Masks;
 use crate::options::Password;
 use crate::prat::{self, PratOptions};
 use crate::progress::Progress;
@@ -77,6 +78,10 @@ pub struct CreateOptions {
     pub recovery_percent: u32,
     /// `.prat` with a password: memory for the key derivation in MiB (`None`: 64).
     pub kdf_mib: Option<u32>,
+    /// Include and exclude masks for the files found in the given folders.
+    pub masks: Masks,
+    /// false: folders contribute only the files directly inside them.
+    pub recursive: bool,
 }
 
 impl CreateOptions {
@@ -93,6 +98,8 @@ impl CreateOptions {
             solid_bytes: None,
             recovery_percent: 0,
             kdf_mib: None,
+            masks: Masks::new(),
+            recursive: true,
         }
     }
 }
@@ -103,6 +110,8 @@ pub struct CreateReport {
     pub bytes_in: u64,
     pub bytes_out: u64,
     pub skipped: Skipped,
+    /// Files that went into the archive (for deleting them afterwards).
+    pub added: Vec<PathBuf>,
 }
 
 /// Packs `inputs` (files and folders) into `output`, which must not exist yet. The archive itself is left out
@@ -116,7 +125,13 @@ pub fn create_archive(
     if output.exists() {
         return Err(Error::Other(format!("'{}' already exists", output.display())));
     }
-    let (mut items, skipped) = input::collect_inputs(inputs)?;
+    let (mut items, skipped) = input::collect_inputs_with(
+        inputs,
+        &CollectOptions {
+            masks: opts.masks.clone(),
+            recursive: opts.recursive,
+        },
+    )?;
     let out_abs = fs::canonicalize(
         output
             .parent()
@@ -140,6 +155,7 @@ pub fn create_archive(
                 bytes_in,
                 bytes_out,
                 skipped,
+                added: items.iter().filter(|i| !i.is_dir).map(|i| i.disk_path.clone()).collect(),
             })
         }
         Err(e) => {
