@@ -28,6 +28,7 @@ pub mod rar;
 pub mod safepath;
 pub mod safety;
 pub mod sevenz;
+pub mod sfx;
 pub mod smart;
 pub mod source;
 pub mod tar;
@@ -35,6 +36,7 @@ pub mod tar;
 pub mod testkit;
 pub mod timeutil;
 pub mod verify;
+pub mod volume;
 pub mod zip;
 
 pub use archive::{Archive, Kind};

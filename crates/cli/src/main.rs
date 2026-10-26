@@ -22,7 +22,7 @@ USAGE:
   packrat-cli test <archive> [--sha256] [--threads N] [--encoding NAME] [PASSWORD OPTIONS]
   packrat-cli repair <archive.prat|zip> [-o FIXED]  rebuild damaged areas from the recovery data (the original is kept)
   packrat-cli create <output> <paths...> [--format FMT] [--level N] [--threads N] [-i MASK] [-x MASK]
-                      [--no-recursion] [--delete-source] [--stdin NAME]
+                      [--no-recursion] [--delete-source] [--stdin NAME] [--volume SIZE] [--sfx]
                       [PASSWORD OPTIONS] [--no-encrypt-names] [--no-filters] [--dict-mb N] [--solid-mb N] [--recovery PCT] [--kdf-mb N]
   packrat-cli hash <files...> [--algo crc32|sha1|sha256|blake3]   checksums of files
   packrat-cli bench [--mb N]               speed of the compressors on generated data in memory (default 16 MiB)
@@ -42,6 +42,10 @@ MASKS AND LISTS:
   repeat them as needed. * is any run of characters, ? one character; a mask without / is tried against every
   folder and file name on the path (`-x node_modules`, `-i *.rs`), a mask with / against the path from the
   archive root. Case is ignored. An argument @FILE is replaced by the lines of FILE (one path or name per line).
+  --volume SIZE (-v; 100m, 4g, ...) cuts the finished archive into volumes name.ext.001, .002, ...; open or extract
+  any of them (or the .001) and Packrat reads the series, as does 7-Zip. --sfx makes a self-extracting program
+  (an .exe that unpacks itself; 7z unless --format says otherwise) from the packrat-sfx.exe stub that sits next
+  to packrat-cli.exe; add --volume to split it as well.
   --no-recursion (7-Zip's -r-) adds only the files directly inside the given folders; --delete-source (-sdel)
   deletes the added files after the archive was written. --stdin NAME stores what arrives on standard input as
   the file NAME; extract --stdout (-so) writes the contents of the chosen files to standard output.
@@ -640,6 +644,14 @@ fn cmd_create(mut args: Args, mode: Mode) -> Result<u8, String> {
     let no_recursion = args.flag("--no-recursion");
     let delete_source = args.flag("--delete-source");
     let stdin_name = args.value(&["--stdin"])?;
+    let sfx = args.flag("--sfx");
+    let volume = args
+        .value(&["--volume", "-v"])?
+        .map(|v| {
+            packrat_core::volume::parse_size(&v)
+                .ok_or_else(|| format!("--volume: cannot read the size '{v}' (try 100m or 4g)"))
+        })
+        .transpose()?;
     let masks = take_masks(&mut args)?;
     if args.0.is_empty() || (args.0.len() < 2 && stdin_name.is_none()) {
         return Err("create: need an output file and at least one path".into());
@@ -705,9 +717,15 @@ fn cmd_create(mut args: Args, mode: Mode) -> Result<u8, String> {
         .iter()
         .find(|e| lower.ends_with(&format!(".{e}")))
         .and_then(|e| Format::from_name(e))
-        .unwrap_or(Format::Zip(packrat_core::zip::ZipMethod::Deflate)),
+        .unwrap_or(if sfx {
+            Format::SevenZ
+        } else {
+            Format::Zip(packrat_core::zip::ZipMethod::Deflate)
+        }),
     };
     let mut opts = CreateOptions::new(format);
+    opts.sfx = sfx;
+    opts.volume_bytes = volume;
     if let Some(l) = level {
         opts.level = l.clamp(1, 9) as u32;
     }

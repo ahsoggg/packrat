@@ -8,7 +8,9 @@ use crate::options::Password;
 use crate::prat::{self, PratOptions};
 use crate::progress::Progress;
 use crate::sevenz::{self, SevenZOptions};
+use crate::sfx;
 use crate::tar;
+use crate::volume;
 use crate::zip::{self, ZipMethod, ZipOptions};
 use std::fs::{self, File};
 use std::io::BufWriter;
@@ -82,6 +84,12 @@ pub struct CreateOptions {
     pub masks: Masks,
     /// false: folders contribute only the files directly inside them.
     pub recursive: bool,
+    /// Cut the finished archive into volumes of this many bytes (`name.ext.001`, `.002`, ...).
+    pub volume_bytes: Option<u64>,
+    /// Make a self-extracting program (`name.exe`) out of the archive.
+    pub sfx: bool,
+    /// The stub for `sfx` (`None`: `packrat-sfx.exe` next to the running program).
+    pub sfx_stub: Option<PathBuf>,
 }
 
 impl CreateOptions {
@@ -100,6 +108,9 @@ impl CreateOptions {
             kdf_mib: None,
             masks: Masks::new(),
             recursive: true,
+            volume_bytes: None,
+            sfx: false,
+            sfx_stub: None,
         }
     }
 }
@@ -122,9 +133,17 @@ pub fn create_archive(
     opts: &CreateOptions,
     progress: &Progress,
 ) -> Result<CreateReport> {
-    if output.exists() {
+    if output.exists() || fs::metadata(format!("{}.001", output.display())).is_ok() {
         return Err(Error::Other(format!("'{}' already exists", output.display())));
     }
+    let stub = if opts.sfx {
+        Some(match &opts.sfx_stub {
+            Some(s) => s.clone(),
+            None => sfx::find_stub()?,
+        })
+    } else {
+        None
+    };
     let (mut items, skipped) = input::collect_inputs_with(
         inputs,
         &CollectOptions {
@@ -146,24 +165,41 @@ pub fn create_archive(
     }
     let bytes_in = items.iter().map(|i| i.size).sum();
 
-    let result = write_to(output, &items, opts, progress);
-    match result {
-        Ok(()) => {
-            let bytes_out = fs::metadata(output)?.len();
-            Ok(CreateReport {
-                entries: items.len(),
-                bytes_in,
-                bytes_out,
-                skipped,
-                added: items
-                    .iter()
-                    .filter(|i| !i.is_dir)
-                    .map(|i| i.disk_path.clone())
-                    .collect(),
-            })
+    let packed = if stub.is_some() {
+        output.with_file_name(format!(
+            "{}.packrat-sfx-tmp",
+            output.file_name().unwrap_or_default().to_string_lossy()
+        ))
+    } else {
+        output.to_path_buf()
+    };
+    let result = write_to(&packed, &items, opts, progress).and_then(|()| {
+        if let Some(stub) = &stub {
+            let built = sfx::build(stub, &packed, output);
+            let _ = fs::remove_file(&packed);
+            built?;
         }
+        match opts.volume_bytes {
+            Some(size) => volume::split_file(output, size)
+                .map(|v| v.iter().filter_map(|p| fs::metadata(p).ok()).map(|m| m.len()).sum()),
+            None => Ok(fs::metadata(output)?.len()),
+        }
+    });
+    match result {
+        Ok(bytes_out) => Ok(CreateReport {
+            entries: items.len(),
+            bytes_in,
+            bytes_out,
+            skipped,
+            added: items
+                .iter()
+                .filter(|i| !i.is_dir)
+                .map(|i| i.disk_path.clone())
+                .collect(),
+        }),
         Err(e) => {
             let _ = fs::remove_file(output);
+            let _ = fs::remove_file(&packed);
             Err(e)
         }
     }

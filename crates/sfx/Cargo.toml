@@ -1,0 +1,20 @@
+[package]
+name = "packrat-sfx"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Packrat self-extractor stub: the program that is put in front of an archive"
+
+[[bin]]
+name = "packrat-sfx"
+path = "src/main.rs"
+
+[dependencies]
+packrat-core = { path = "../core" }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_System_Console"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"

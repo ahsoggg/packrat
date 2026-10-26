@@ -28,7 +28,14 @@ pub fn open_with(path: &Path, opts: &OpenOptions) -> Result<Box<dyn Archive>> {
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    open_inner(Arc::new(FileSource::open(path)?), &name, opts, Some(path))
+    // a volume of a split archive (`x.7z.001`) opens the whole series
+    match crate::volume::series(path)? {
+        Some(parts) => {
+            let src: SharedSource = Arc::new(crate::volume::MultiSource::open(&parts)?);
+            open_inner(src, crate::volume::logical_name(&name), opts, None)
+        }
+        None => open_inner(Arc::new(FileSource::open(path)?), &name, opts, Some(path)),
+    }
 }
 
 pub fn open_source(src: SharedSource, name: &str) -> Result<Box<dyn Archive>> {
@@ -49,6 +56,11 @@ fn open_inner(src: SharedSource, name: &str, opts: &OpenOptions, path: Option<&P
     let head = &head[..n];
     let lower = name.to_ascii_lowercase();
 
+    if head.starts_with(b"MZ")
+        && let Some(inner) = open_in_program(&src, name, opts)?
+    {
+        return Ok(inner);
+    }
     if head.starts_with(b"PK\x03\x04") || head.starts_with(b"PK\x05\x06") || head.starts_with(b"PK\x07\x08") {
         return Ok(Box::new(ZipArchive::from_source_with(src, opts)?));
     }
@@ -107,6 +119,54 @@ fn open_inner(src: SharedSource, name: &str, opts: &OpenOptions, path: Option<&P
         return Ok(Box::new(ZipArchive::from_source_with(src, opts)?));
     }
     Err(Error::Unsupported("unknown archive format".into()))
+}
+
+/// Most bytes of a program that are searched for an archive when there is no Packrat trailer.
+const SFX_SCAN: u64 = 16 << 20;
+/// Most signature hits that are tried.
+const SFX_TRIES: usize = 24;
+
+/// A self-extracting program: its archive follows the program code. Packrat's own are found through their
+/// trailer; others (7-Zip, WinRAR-less ZIP stubs) by looking for an archive signature after the program.
+/// `None` when the file holds no archive (then it is not treated as one).
+fn open_in_program(src: &SharedSource, name: &str, opts: &OpenOptions) -> Result<Option<Box<dyn Archive>>> {
+    use crate::volume::SliceSource;
+    let inner_name = |n: &str| {
+        n.strip_suffix(".exe")
+            .or_else(|| n.strip_suffix(".EXE"))
+            .unwrap_or(n)
+            .to_owned()
+    };
+    if let Some((off, len)) = crate::sfx::find_payload(&**src) {
+        let slice: SharedSource = Arc::new(SliceSource::new(src.clone(), off, len));
+        return open_inner(slice, &inner_name(name), opts, None).map(Some);
+    }
+    let scan = src.len().min(SFX_SCAN);
+    let mut data = vec![0u8; scan as usize];
+    read_exact_at(&**src, 0, &mut data)?;
+    const SIGNATURES: [&[u8]; 3] = [&[0x37, 0x7a, 0xbc, 0xaf, 0x27, 0x1c], b"PK", &prat::format::MAGIC];
+    let mut hits: Vec<usize> = Vec::new();
+    for sig in SIGNATURES {
+        let mut from = 1;
+        while let Some(i) = data[from..].windows(sig.len()).position(|w| w == sig) {
+            hits.push(from + i);
+            from += i + 1;
+            if hits.len() > SFX_TRIES * 4 {
+                break;
+            }
+        }
+    }
+    hits.sort_unstable();
+    for off in hits.into_iter().take(SFX_TRIES) {
+        let slice: SharedSource = Arc::new(SliceSource::new(src.clone(), off as u64, src.len() - off as u64));
+        // an error that is about the password means the archive is real
+        match open_inner(slice, &inner_name(name), opts, None) {
+            Ok(a) if !a.entries().is_empty() => return Ok(Some(a)),
+            Err(Error::PasswordRequired | Error::WrongPassword) => return Err(Error::PasswordRequired),
+            _ => {}
+        }
+    }
+    Ok(None)
 }
 
 /// A bare `.gz` / `.bz2` / `.xz` / `.zst` / `.lz4` file: an archive with exactly one entry.
