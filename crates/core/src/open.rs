@@ -8,6 +8,7 @@ use crate::entry::{Entry, EntryKind};
 use crate::error::{Error, Result};
 use crate::lha::LhaArchive;
 use crate::options::OpenOptions;
+use crate::prat::{self, PratArchive};
 use crate::rar::RarArchive;
 use crate::sevenz::SevenZArchive;
 use crate::source::{FileSource, SharedSource, SourceReader, read_exact_at};
@@ -53,6 +54,9 @@ fn open_inner(src: SharedSource, name: &str, opts: &OpenOptions, path: Option<&P
     }
     if head.starts_with(&[0x37, 0x7a, 0xbc, 0xaf, 0x27, 0x1c]) {
         return Ok(Box::new(SevenZArchive::from_source_with(src, opts)?));
+    }
+    if head.starts_with(&prat::format::MAGIC) {
+        return Ok(Box::new(PratArchive::from_source(src)?));
     }
     if rar::is_rar(head) {
         return match path {

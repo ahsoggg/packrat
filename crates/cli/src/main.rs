@@ -19,7 +19,7 @@ USAGE:
   packrat-cli bench-gen <dir> [--mb N]     write the deterministic data set used by scripts/bench.ps1
   packrat-cli --version | --help
 
-FORMATS (create): zip (deflate), zip-zstd, zip-store, 7z, tar, tar.gz, tar.zst, tar.xz, tar.lz4
+FORMATS (create): zip (deflate), zip-zstd, zip-store, 7z, prat, tar, tar.gz, tar.zst, tar.xz, tar.lz4
   The format is taken from the output extension when --format is not given.
 
 EXTRACT:
@@ -32,6 +32,9 @@ PASSWORD OPTIONS: --ask-password | --password-file FILE | env PACKRAT_PASSWORD
   (--no-encrypt-names keeps them visible). TAR cannot be encrypted.
   7z sorts files by type, runs a BCJ filter over executables and stores already-packed files (JPEG, MP4, ZIP...)
   as they are; --no-filters keeps the input order and compresses everything the same way.
+  prat is Packrat's own format: files are cut into content-defined chunks and identical chunks are stored once
+  (copies, backups, versions of the same project shrink a lot), blocks are zstd (--level 1-9, --solid-mb sets
+  the block size, 1-128, default 16) and every block carries a BLAKE3 hash. Only Packrat opens it for now.
   --dict-mb sets the 7z (LZMA2) dictionary and --solid-mb the size of one solid block. By default the dictionary
   follows the level (16 MiB at 5, 64 MiB at 9, never more than the data) and a block is eight dictionaries, at
   least 64 MiB; bigger values pack better and use more memory. Encoders never take more than half of free RAM.

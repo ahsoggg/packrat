@@ -1,0 +1,9 @@
+//! The native `.prat` format: content-defined deduplication, solid blocks that still open one file at a time,
+//! BLAKE3 integrity everywhere. Layout and rationale: `docs/PRAT_FORMAT.md`.
+
+pub mod format;
+pub mod read;
+pub mod write;
+
+pub use read::PratArchive;
+pub use write::{PratOptions, PratStats, write_prat};

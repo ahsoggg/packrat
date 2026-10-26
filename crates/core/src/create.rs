@@ -4,6 +4,7 @@ use crate::codec::stream::Compression;
 use crate::error::{Error, Result};
 use crate::input::{self, InputItem, Skipped};
 use crate::options::Password;
+use crate::prat::{self, PratOptions};
 use crate::progress::Progress;
 use crate::sevenz::{self, SevenZOptions};
 use crate::tar;
@@ -16,6 +17,8 @@ use std::path::{Path, PathBuf};
 pub enum Format {
     Zip(ZipMethod),
     SevenZ,
+    /// Packrat's own format: deduplication, solid blocks with random access, BLAKE3 integrity.
+    Prat,
     /// TAR, optionally compressed: gz, zstd, xz or lz4.
     Tar(Compression),
 }
@@ -26,6 +29,7 @@ impl Format {
         match self {
             Format::Zip(_) => "zip",
             Format::SevenZ => "7z",
+            Format::Prat => "prat",
             Format::Tar(Compression::None) => "tar",
             Format::Tar(Compression::Gz) => "tar.gz",
             Format::Tar(Compression::Zst) => "tar.zst",
@@ -41,6 +45,7 @@ impl Format {
             "zip-zstd" => Format::Zip(ZipMethod::Zstd),
             "zip-store" => Format::Zip(ZipMethod::Store),
             "7z" => Format::SevenZ,
+            "prat" => Format::Prat,
             "tar" => Format::Tar(Compression::None),
             "tar.gz" | "tgz" => Format::Tar(Compression::Gz),
             "tar.zst" | "tzst" => Format::Tar(Compression::Zst),
@@ -162,6 +167,22 @@ fn write_to(output: &Path, items: &[InputItem], opts: &CreateOptions, progress: 
                 solid_bytes: opts.solid_bytes,
             };
             sevenz::write_7z(file, items, &sopts, progress)?;
+        }
+        Format::Prat if opts.password.is_some() => {
+            return Err(Error::Unsupported(
+                "encryption is not available in .prat yet: use ZIP or 7z".into(),
+            ));
+        }
+        Format::Prat => {
+            let mut popts = PratOptions {
+                level: opts.level,
+                threads: opts.threads,
+                ..Default::default()
+            };
+            if let Some(b) = opts.solid_bytes {
+                popts.block_bytes = usize::try_from(b.clamp(1 << 20, 128 << 20)).unwrap_or(16 << 20);
+            }
+            prat::write_prat(file, items, &popts, progress)?;
         }
         Format::Tar(_) if opts.password.is_some() => {
             return Err(Error::Unsupported(

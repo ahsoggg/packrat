@@ -18,6 +18,7 @@ pub mod lha;
 pub mod open;
 pub mod options;
 pub mod par;
+pub mod prat;
 pub mod preview;
 pub mod progress;
 pub mod ranged;

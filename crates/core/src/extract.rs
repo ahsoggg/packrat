@@ -535,7 +535,9 @@ pub fn execute(
             .build()
             .map_err(|e| Error::Other(format!("cannot start worker threads: {e}")))?;
         let mut order = files.clone();
-        order.sort_by_key(|i| std::cmp::Reverse(i.size)); // big files first keeps all threads busy to the end
+        if !archive.prefers_archive_order() {
+            order.sort_by_key(|i| std::cmp::Reverse(i.size)); // big files first keeps all threads busy to the end
+        }
         outcomes = pool.install(|| {
             order
                 .par_iter()

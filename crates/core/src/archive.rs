@@ -24,6 +24,7 @@ pub enum Kind {
     Cpio,
     Rpm,
     Iso,
+    Prat,
 }
 
 impl Kind {
@@ -49,13 +50,14 @@ impl Kind {
             Kind::Cpio => "CPIO",
             Kind::Rpm => "RPM",
             Kind::Iso => "ISO",
+            Kind::Prat => "PRAT",
         }
     }
 
     /// True when entries can be opened independently (central directory), so extraction can use many
     /// threads and a preview does not have to read what comes before the entry.
     pub fn random_access(self) -> bool {
-        matches!(self, Kind::Zip | Kind::Ar | Kind::Cpio | Kind::Iso)
+        matches!(self, Kind::Zip | Kind::Ar | Kind::Cpio | Kind::Iso | Kind::Prat)
     }
 }
 
@@ -87,6 +89,12 @@ pub trait Archive: Send + Sync {
 
     fn random_access(&self) -> bool {
         self.kind().random_access()
+    }
+
+    /// For random-access formats whose entries share decoded data (blocks): extract in archive order, not by size,
+    /// so that threads working at the same time need the same few blocks.
+    fn prefers_archive_order(&self) -> bool {
+        false
     }
 
     /// Opens one entry for reading. For streaming formats this decodes everything before the entry, so
