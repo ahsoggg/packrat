@@ -5,6 +5,7 @@ pub mod format;
 pub mod read;
 pub mod recover;
 pub mod write;
+pub mod zip_recover;
 
 pub use read::PratArchive;
 pub use write::{PratOptions, PratStats, write_prat};

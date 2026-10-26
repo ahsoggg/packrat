@@ -14,7 +14,7 @@ USAGE:
                       [--skip | --overwrite | --keep-both] [--accept-risks] [--repair]
                       [--encoding NAME] [PASSWORD OPTIONS]
   packrat-cli test <archive> [--sha256] [--threads N] [--encoding NAME] [PASSWORD OPTIONS]
-  packrat-cli repair <archive.prat> [-o FIXED]   rebuild damaged areas from the recovery data (the original is kept)
+  packrat-cli repair <archive.prat|zip> [-o FIXED]  rebuild damaged areas from the recovery data (the original is kept)
   packrat-cli create <output> <paths...> [--format FMT] [--level N] [--threads N]
                       [PASSWORD OPTIONS] [--no-encrypt-names] [--no-filters] [--dict-mb N] [--solid-mb N] [--recovery PCT]
   packrat-cli bench-gen <dir> [--mb N]     write the deterministic data set used by scripts/bench.ps1
@@ -36,8 +36,10 @@ PASSWORD OPTIONS: --ask-password | --password-file FILE | env PACKRAT_PASSWORD
   prat is Packrat's own format: files are cut into content-defined chunks and identical chunks are stored once
   (copies, backups, versions of the same project shrink a lot), blocks are zstd (--level 1-9, --solid-mb sets
   the block size, 1-128, default 16) and every block carries a BLAKE3 hash. Only Packrat opens it for now.
-  --recovery PCT (prat only) adds Reed-Solomon recovery data of PCT percent of the archive size: any damaged
+  --recovery PCT (prat and zip) adds Reed-Solomon recovery data of PCT percent of the archive size: any damaged
   areas up to that amount can be rebuilt with `repair`, which writes a repaired copy and never touches the original.
+  A ZIP with recovery data is still an ordinary ZIP: WinRAR, 7-Zip and Explorer open it (they skip the recovery
+  data), and only Packrat can repair it.
   --dict-mb sets the 7z (LZMA2) dictionary and --solid-mb the size of one solid block. By default the dictionary
   follows the level (16 MiB at 5, 64 MiB at 9, never more than the data) and a block is eight dictionaries, at
   least 64 MiB; bigger values pack better and use more memory. Encoders never take more than half of free RAM.
@@ -521,11 +523,24 @@ fn cmd_repair(mut args: Args) -> Result<u8, String> {
                 .file_stem()
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            src.with_file_name(format!("{stem}.repaired.prat"))
+            let ext = src
+                .extension()
+                .map_or_else(|| "prat".to_owned(), |e| e.to_string_lossy().into_owned());
+            src.with_file_name(format!("{stem}.repaired.{ext}"))
         }
     };
     let started = std::time::Instant::now();
-    match packrat_core::prat::recover::repair(&src, &dst) {
+    let mut magic = [0u8; 8];
+    let is_zip = std::fs::File::open(&src)
+        .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut magic))
+        .is_ok()
+        && magic.starts_with(b"PK");
+    let repaired = if is_zip {
+        packrat_core::prat::zip_recover::repair(&src, &dst)
+    } else {
+        packrat_core::prat::recover::repair(&src, &dst)
+    };
+    match repaired {
         Ok(r) => {
             if r.repaired == 0 && !r.footer_rewritten && !r.recovery_rewritten {
                 println!(

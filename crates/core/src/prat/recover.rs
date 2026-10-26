@@ -71,7 +71,19 @@ impl Plan {
         })
     }
 
-    fn table_len(&self) -> u64 {
+    /// The numbers must be ones a writer could have produced, whatever the file says.
+    pub(crate) fn is_sane(&self) -> bool {
+        self.shard >= 64
+            && self.shard.is_multiple_of(64)
+            && self.data_shards >= 1
+            && u64::from(self.data_shards) <= MAX_DATA_SHARDS * 2
+            && self.parity_shards >= 1
+            && self.parity_shards <= 32768
+            && u64::from(self.data_shards) * u64::from(self.shard) >= self.protected
+            && u64::from(self.data_shards) * u64::from(self.shard) - self.protected < u64::from(self.shard)
+    }
+
+    pub(crate) fn table_len(&self) -> u64 {
         4 * (u64::from(self.data_shards) + u64::from(self.parity_shards)) + 4
     }
 
@@ -115,22 +127,14 @@ fn decode_header(h: &[u8]) -> Result<(Plan, [u8; FOOTER_LEN])> {
         parity_shards: u32::from_le_bytes(h[20..24].try_into().unwrap()),
         protected: u64::from_le_bytes(h[24..32].try_into().unwrap()),
     };
-    // the numbers must be ones a writer could have produced, whatever the file says
-    let sane = plan.shard >= 64
-        && plan.shard.is_multiple_of(64)
-        && plan.data_shards >= 1
-        && u64::from(plan.data_shards) <= MAX_DATA_SHARDS * 2
-        && plan.parity_shards >= 1
-        && plan.parity_shards <= 32768
-        && u64::from(plan.data_shards) * u64::from(plan.shard) >= plan.protected
-        && u64::from(plan.data_shards) * u64::from(plan.shard) - plan.protected < u64::from(plan.shard);
+    let sane = plan.is_sane();
     if !sane {
         return bad("the recovery header has impossible numbers");
     }
     Ok((plan, h[32..32 + FOOTER_LEN].try_into().unwrap()))
 }
 
-fn encode_table(data: &[u32], parity: &[u32]) -> Vec<u8> {
+pub(crate) fn encode_table(data: &[u32], parity: &[u32]) -> Vec<u8> {
     let mut t = Vec::with_capacity(4 * (data.len() + parity.len()) + 4);
     for c in data.iter().chain(parity) {
         t.extend_from_slice(&c.to_le_bytes());
@@ -140,7 +144,7 @@ fn encode_table(data: &[u32], parity: &[u32]) -> Vec<u8> {
     t
 }
 
-fn decode_table(t: &[u8], plan: &Plan) -> Option<(Vec<u32>, Vec<u32>)> {
+pub(crate) fn decode_table(t: &[u8], plan: &Plan) -> Option<(Vec<u32>, Vec<u32>)> {
     if t.len() as u64 != plan.table_len() {
         return None;
     }
@@ -163,6 +167,154 @@ fn read_footer(f: &mut File, len: u64) -> Result<Footer> {
     Footer::decode(&b)
 }
 
+/// A parity shard and its index among the parity shards.
+pub(crate) type ParityShard = (usize, Vec<u8>);
+
+fn rs_err(e: impl std::fmt::Display) -> Error {
+    Error::Other(format!("recovery: {e}"))
+}
+
+/// Cuts the first `plan.protected` bytes of `f` into shards and computes the parity: the CRC of every data shard and
+/// the parity shards themselves.
+pub(crate) fn encode_shards(f: &mut File, plan: &Plan) -> Result<(Vec<u32>, Vec<Vec<u8>>)> {
+    let (k, m, s) = (
+        plan.data_shards as usize,
+        plan.parity_shards as usize,
+        plan.shard as usize,
+    );
+    let mut enc = ReedSolomonEncoder::new(k, m, s).map_err(rs_err)?;
+    let mut data_crcs = Vec::with_capacity(k);
+    let mut buf = vec![0u8; s];
+    f.seek(SeekFrom::Start(0))?;
+    let mut left = plan.protected;
+    for _ in 0..k {
+        let n = left.min(s as u64) as usize;
+        f.read_exact(&mut buf[..n])?;
+        buf[n..].fill(0);
+        left -= n as u64;
+        data_crcs.push(crc32fast::hash(&buf));
+        enc.add_original_shard(&buf).map_err(rs_err)?;
+    }
+    let result = enc.encode().map_err(rs_err)?;
+    Ok((data_crcs, result.recovery_iter().map(<[u8]>::to_vec).collect()))
+}
+
+/// Parity shards for shards that are already in memory.
+pub(crate) fn encode_parity(plan: &Plan, shards: &[Vec<u8>]) -> Result<Vec<Vec<u8>>> {
+    let mut enc = ReedSolomonEncoder::new(
+        plan.data_shards as usize,
+        plan.parity_shards as usize,
+        plan.shard as usize,
+    )
+    .map_err(rs_err)?;
+    for sh in shards {
+        enc.add_original_shard(sh).map_err(rs_err)?;
+    }
+    let result = enc.encode().map_err(rs_err)?;
+    Ok(result.recovery_iter().map(<[u8]>::to_vec).collect())
+}
+
+/// Reads the protected bytes as shards (zero-padded) and returns them with the indexes of those whose CRC is wrong.
+pub(crate) fn read_shards(f: &mut File, plan: &Plan, data_crcs: &[u32]) -> Result<(Vec<Vec<u8>>, Vec<usize>)> {
+    let s = plan.shard as usize;
+    let mut shards = Vec::with_capacity(data_crcs.len());
+    let mut damaged = Vec::new();
+    f.seek(SeekFrom::Start(0))?;
+    let mut left = plan.protected;
+    for (i, &want) in data_crcs.iter().enumerate() {
+        let n = left.min(s as u64) as usize;
+        let mut buf = vec![0u8; s];
+        let mut filled = 0;
+        while filled < n {
+            match f.read(&mut buf[filled..n]) {
+                Ok(0) | Err(_) => break,
+                Ok(x) => filled += x,
+            }
+        }
+        left -= n as u64;
+        if crc32fast::hash(&buf) != want {
+            damaged.push(i);
+        }
+        shards.push(buf);
+    }
+    Ok((shards, damaged))
+}
+
+/// Checks every parity shard; returns the first `want` intact ones and whether any was damaged.
+pub(crate) fn read_good_parity(
+    f: &mut File,
+    parity_at: u64,
+    plan: &Plan,
+    parity_crcs: &[u32],
+    want: usize,
+) -> Result<(Vec<ParityShard>, bool)> {
+    let s = plan.shard as usize;
+    let mut good = Vec::new();
+    let mut any_damaged = false;
+    for (j, &crc) in parity_crcs.iter().enumerate() {
+        let mut p = vec![0u8; s];
+        f.seek(SeekFrom::Start(parity_at + (j * s) as u64))?;
+        if f.read_exact(&mut p).is_ok() && crc32fast::hash(&p) == crc {
+            if good.len() < want {
+                good.push((j, p));
+            }
+        } else {
+            any_damaged = true;
+        }
+    }
+    Ok((good, any_damaged))
+}
+
+/// Rebuilds the `damaged` shards from the intact ones and `good` parity shards, checks each against its CRC, writes
+/// it into `f` at its place and keeps `shards` in step. Returns how many were rebuilt.
+pub(crate) fn reconstruct(
+    f: &mut File,
+    plan: &Plan,
+    shards: &mut [Vec<u8>],
+    damaged: &[usize],
+    good: &[ParityShard],
+    data_crcs: &[u32],
+) -> Result<u32> {
+    if damaged.is_empty() {
+        return Ok(0);
+    }
+    let s = plan.shard as usize;
+    if good.len() < damaged.len() {
+        return Err(Error::Corrupt(format!(
+            "{} damaged areas of {} KiB, but only {} intact repair blocks: this archive cannot be repaired",
+            damaged.len(),
+            s >> 10,
+            good.len()
+        )));
+    }
+    let mut dec = ReedSolomonDecoder::new(plan.data_shards as usize, plan.parity_shards as usize, s).map_err(rs_err)?;
+    for (i, sh) in shards.iter().enumerate() {
+        if !damaged.contains(&i) {
+            dec.add_original_shard(i, sh).map_err(rs_err)?;
+        }
+    }
+    for (j, p) in good {
+        dec.add_recovery_shard(*j, p).map_err(rs_err)?;
+    }
+    let restored = dec.decode().map_err(rs_err)?;
+    let mut done = 0;
+    for (i, data) in restored.restored_original_iter() {
+        if crc32fast::hash(data) != data_crcs[i] {
+            return Err(Error::Corrupt("the rebuilt data does not match its checksum".into()));
+        }
+        let at = (i * s) as u64;
+        let n = (plan.protected - at).min(s as u64) as usize;
+        f.seek(SeekFrom::Start(at))?;
+        f.write_all(&data[..n])?;
+        shards[i].copy_from_slice(data);
+        done += 1;
+    }
+    if done as usize != damaged.len() {
+        return Err(Error::Corrupt("not every damaged area could be rebuilt".into()));
+    }
+    Ok(done)
+}
+
 /// Appends recovery data (`percent` of the archive size) to a finished `.prat` file.
 pub fn add_recovery(path: &Path, percent: u32) -> Result<Plan> {
     let mut f = OpenOptions::new().read(true).write(true).open(path)?;
@@ -175,28 +327,7 @@ pub fn add_recovery(path: &Path, percent: u32) -> Result<Plan> {
         .ok_or_else(|| Error::Other("this archive already has recovery data (or an unexpected layout)".into()))?;
     let plan = Plan::new(protected, percent)?;
     let footer_bytes = footer.encode();
-
-    let (k, m, s) = (
-        plan.data_shards as usize,
-        plan.parity_shards as usize,
-        plan.shard as usize,
-    );
-    let mut enc = ReedSolomonEncoder::new(k, m, s).map_err(|e| Error::Other(format!("recovery: {e}")))?;
-    let mut data_crcs = Vec::with_capacity(k);
-    let mut buf = vec![0u8; s];
-    f.seek(SeekFrom::Start(0))?;
-    let mut left = protected;
-    for _ in 0..k {
-        let n = left.min(s as u64) as usize;
-        f.read_exact(&mut buf[..n])?;
-        buf[n..].fill(0);
-        left -= n as u64;
-        data_crcs.push(crc32fast::hash(&buf));
-        enc.add_original_shard(&buf)
-            .map_err(|e| Error::Other(format!("recovery: {e}")))?;
-    }
-    let result = enc.encode().map_err(|e| Error::Other(format!("recovery: {e}")))?;
-    let parity: Vec<&[u8]> = result.recovery_iter().collect();
+    let (data_crcs, parity) = encode_shards(&mut f, &plan)?;
     let parity_crcs: Vec<u32> = parity.iter().map(|p| crc32fast::hash(p)).collect();
 
     let header = encode_header(&plan, &footer_bytes);
@@ -315,11 +446,7 @@ fn repair_into(src: &Path, dst: &Path) -> Result<RepairReport> {
     fs::copy(src, dst)?;
     let mut f = OpenOptions::new().read(true).write(true).open(dst)?;
     let (start, plan, footer_copy) = locate(&mut f, len)?;
-    let (k, m, s) = (
-        plan.data_shards as usize,
-        plan.parity_shards as usize,
-        plan.shard as usize,
-    );
+    let k = plan.data_shards as usize;
 
     // the CRC tables: either copy will do
     let tab_len = plan.table_len();
@@ -333,84 +460,16 @@ fn repair_into(src: &Path, dst: &Path) -> Result<RepairReport> {
         .ok_or_else(|| Error::Corrupt("both copies of the recovery checksums are damaged".into()))?;
 
     // find the damaged shards of the protected area
-    let mut shards: Vec<Vec<u8>> = Vec::with_capacity(k);
-    let mut damaged: Vec<usize> = Vec::new();
-    f.seek(SeekFrom::Start(0))?;
-    let mut left = plan.protected;
-    for (i, &want) in data_crcs.iter().enumerate() {
-        let n = left.min(s as u64) as usize;
-        let mut buf = vec![0u8; s];
-        let got = f.read(&mut buf[..n]).unwrap_or(0);
-        let mut filled = got;
-        while filled < n {
-            match f.read(&mut buf[filled..n]) {
-                Ok(0) | Err(_) => break,
-                Ok(x) => filled += x,
-            }
-        }
-        left -= n as u64;
-        if crc32fast::hash(&buf) != want {
-            damaged.push(i);
-        }
-        shards.push(buf);
-    }
-
+    let (mut shards, damaged) = read_shards(&mut f, &plan, &data_crcs)?;
+    let parity_at = start + REC_HEADER_LEN as u64 + 2 * tab_len;
+    // every parity shard is checked: a damaged one means the recovery data needs refreshing
+    let (good_parity, parity_damaged) = read_good_parity(&mut f, parity_at, &plan, &parity_crcs, damaged.len())?;
     let mut report = RepairReport {
         shards: k as u32,
         shard_bytes: plan.shard,
         ..Default::default()
     };
-    // intact parity shards (every one is checked: a damaged one means the recovery data needs refreshing)
-    let parity_at = start + REC_HEADER_LEN as u64 + 2 * tab_len;
-    let mut good_parity: Vec<(usize, Vec<u8>)> = Vec::new();
-    let mut parity_damaged = false;
-    for (j, &want) in parity_crcs.iter().enumerate() {
-        let mut p = vec![0u8; s];
-        f.seek(SeekFrom::Start(parity_at + (j * s) as u64))?;
-        if f.read_exact(&mut p).is_ok() && crc32fast::hash(&p) == want {
-            if good_parity.len() < damaged.len() {
-                good_parity.push((j, p));
-            }
-        } else {
-            parity_damaged = true;
-        }
-    }
-    if !damaged.is_empty() {
-        if good_parity.len() < damaged.len() {
-            return Err(Error::Corrupt(format!(
-                "{} damaged areas of {} KiB, but only {} intact repair blocks: this archive cannot be repaired",
-                damaged.len(),
-                s >> 10,
-                good_parity.len()
-            )));
-        }
-        let mut dec = ReedSolomonDecoder::new(k, m, s).map_err(|e| Error::Other(format!("recovery: {e}")))?;
-        for (i, sh) in shards.iter().enumerate() {
-            if !damaged.contains(&i) {
-                dec.add_original_shard(i, sh)
-                    .map_err(|e| Error::Other(format!("recovery: {e}")))?;
-            }
-        }
-        for (j, p) in &good_parity {
-            dec.add_recovery_shard(*j, p)
-                .map_err(|e| Error::Other(format!("recovery: {e}")))?;
-        }
-        let restored = dec.decode().map_err(|e| Error::Other(format!("recovery: {e}")))?;
-        for (i, data) in restored.restored_original_iter() {
-            if crc32fast::hash(data) != data_crcs[i] {
-                return Err(Error::Corrupt("the rebuilt data does not match its checksum".into()));
-            }
-            let at = (i * s) as u64;
-            let n = (plan.protected - at).min(s as u64) as usize;
-            f.seek(SeekFrom::Start(at))?;
-            f.write_all(&data[..n])?;
-            shards[i].copy_from_slice(data);
-            report.repaired += 1;
-        }
-        if report.repaired as usize != damaged.len() {
-            return Err(Error::Corrupt("not every damaged area could be rebuilt".into()));
-        }
-    }
+    report.repaired = reconstruct(&mut f, &plan, &mut shards, &damaged, &good_parity, &data_crcs)?;
 
     // the recovery data: generate it again when a parity shard, a table or a header is damaged
     let header = encode_header(&plan, &footer_copy);
@@ -422,13 +481,7 @@ fn repair_into(src: &Path, dst: &Path) -> Result<RepairReport> {
     f.read_exact(&mut header_b)?;
     let tables_ok = ta == tb && decode_table(&ta, &plan).is_some();
     if parity_damaged || !tables_ok || header_a != header || header_b != header {
-        let mut enc = ReedSolomonEncoder::new(k, m, s).map_err(|e| Error::Other(format!("recovery: {e}")))?;
-        for sh in &shards {
-            enc.add_original_shard(sh)
-                .map_err(|e| Error::Other(format!("recovery: {e}")))?;
-        }
-        let result = enc.encode().map_err(|e| Error::Other(format!("recovery: {e}")))?;
-        let parity: Vec<&[u8]> = result.recovery_iter().collect();
+        let parity = encode_parity(&plan, &shards)?;
         let new_parity_crcs: Vec<u32> = parity.iter().map(|p| crc32fast::hash(p)).collect();
         let table = encode_table(&data_crcs, &new_parity_crcs);
         f.seek(SeekFrom::Start(start))?;

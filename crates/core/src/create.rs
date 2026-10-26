@@ -147,9 +147,9 @@ pub fn create_archive(
 }
 
 fn write_to(output: &Path, items: &[InputItem], opts: &CreateOptions, progress: &Progress) -> Result<()> {
-    if opts.recovery_percent > 0 && opts.format != Format::Prat {
+    if opts.recovery_percent > 0 && !matches!(opts.format, Format::Prat | Format::Zip(_)) {
         return Err(Error::Unsupported(
-            "recovery data is only available in .prat archives (--format prat)".into(),
+            "recovery data is only available in .prat and ZIP archives".into(),
         ));
     }
     let file = File::options().write(true).create_new(true).open(output)?;
@@ -163,6 +163,9 @@ fn write_to(output: &Path, items: &[InputItem], opts: &CreateOptions, progress: 
                 ..Default::default()
             };
             zip::write_zip(BufWriter::with_capacity(256 << 10, file), items, &zopts, progress)?;
+            if opts.recovery_percent > 0 {
+                prat::zip_recover::add_recovery(output, opts.recovery_percent)?;
+            }
         }
         Format::SevenZ => {
             let sopts = SevenZOptions {
