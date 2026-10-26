@@ -89,16 +89,16 @@ fn le64(b: &[u8], at: usize) -> u64 {
     u64::from_le_bytes(b[at..at + 8].try_into().unwrap())
 }
 
-struct EndRecord {
-    entries: u64,
-    cd_size: u64,
-    cd_offset: u64,
+pub(super) struct EndRecord {
+    pub(super) entries: u64,
+    pub(super) cd_size: u64,
+    pub(super) cd_offset: u64,
     /// Offset of the structure that ends the central directory (EOCD or Zip64 EOCD).
-    end_of_cd: u64,
-    comment: Vec<u8>,
+    pub(super) end_of_cd: u64,
+    pub(super) comment: Vec<u8>,
 }
 
-fn find_end_record(src: &dyn crate::source::Source) -> Result<EndRecord> {
+pub(super) fn find_end_record(src: &dyn crate::source::Source) -> Result<EndRecord> {
     let len = src.len();
     if len < 22 {
         return corrupt("the file is too small to be a ZIP archive");

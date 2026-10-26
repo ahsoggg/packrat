@@ -387,16 +387,38 @@ fn masks_listfiles_stdout_hash_and_delete_source() {
         .unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let listing = String::from_utf8_lossy(&cli().arg("list").arg(&zip).output().unwrap().stdout).into_owned();
-    assert!(listing.contains("src/a.rs") && listing.contains("src/sub/b.rs"), "{listing}");
-    assert!(!listing.contains("c.log") && !listing.contains("node_modules"), "{listing}");
+    assert!(
+        listing.contains("src/a.rs") && listing.contains("src/sub/b.rs"),
+        "{listing}"
+    );
+    assert!(
+        !listing.contains("c.log") && !listing.contains("node_modules"),
+        "{listing}"
+    );
 
     // names with wildcards select, --stdout streams the contents
-    let out = cli().arg("extract").arg(&zip).arg("src/sub/*.rs").arg("-so").output().unwrap();
+    let out = cli()
+        .arg("extract")
+        .arg(&zip)
+        .arg("src/sub/*.rs")
+        .arg("-so")
+        .output()
+        .unwrap();
     assert_eq!(out.stdout, b"B");
 
     // only the include mask, no recursion
     let flat = dir.path().join("flat.zip");
-    assert!(cli().arg("create").arg(&flat).arg(&src).args(["-i", "*.rs", "-r-"]).output().unwrap().status.success());
+    assert!(
+        cli()
+            .arg("create")
+            .arg(&flat)
+            .arg(&src)
+            .args(["-i", "*.rs", "-r-"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
     let listing = String::from_utf8_lossy(&cli().arg("list").arg(&flat).output().unwrap().stdout).into_owned();
     assert!(listing.contains("src/a.rs") && !listing.contains("b.rs"), "{listing}");
 
@@ -412,12 +434,27 @@ fn masks_listfiles_stdout_hash_and_delete_source() {
         .unwrap();
     child.stdin.take().unwrap().write_all(b"from stdin").unwrap();
     assert!(child.wait().unwrap().success());
-    let out = cli().arg("extract").arg(&tgz).arg("note.txt").arg("-so").output().unwrap();
+    let out = cli()
+        .arg("extract")
+        .arg(&tgz)
+        .arg("note.txt")
+        .arg("-so")
+        .output()
+        .unwrap();
     assert_eq!(out.stdout, b"from stdin");
 
     // hash
-    let out = cli().arg("hash").arg(src.join("a.rs")).args(["--algo", "crc32"]).output().unwrap();
-    assert!(String::from_utf8_lossy(&out.stdout).starts_with("d3d99e8b"), "{:?}", out);
+    let out = cli()
+        .arg("hash")
+        .arg(src.join("a.rs"))
+        .args(["--algo", "crc32"])
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&out.stdout).starts_with("d3d99e8b"),
+        "{:?}",
+        out
+    );
 
     // --delete-source removes what was added and the folders left empty
     let gone = dir.path().join("gone.7z");

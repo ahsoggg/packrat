@@ -16,6 +16,7 @@ pub mod input;
 pub mod iso;
 pub mod lha;
 pub mod mask;
+pub mod modify;
 pub mod open;
 pub mod options;
 pub mod par;

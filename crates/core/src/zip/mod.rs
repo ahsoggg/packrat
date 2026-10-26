@@ -2,6 +2,7 @@
 //! blocks compressed on worker threads.
 
 pub mod crypto;
+pub mod edit;
 mod extra;
 pub mod read;
 mod recover;

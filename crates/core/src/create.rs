@@ -155,7 +155,11 @@ pub fn create_archive(
                 bytes_in,
                 bytes_out,
                 skipped,
-                added: items.iter().filter(|i| !i.is_dir).map(|i| i.disk_path.clone()).collect(),
+                added: items
+                    .iter()
+                    .filter(|i| !i.is_dir)
+                    .map(|i| i.disk_path.clone())
+                    .collect(),
             })
         }
         Err(e) => {

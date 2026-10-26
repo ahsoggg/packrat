@@ -62,13 +62,7 @@ pub fn collect_inputs_with(paths: &[PathBuf], opts: &CollectOptions) -> Result<(
     Ok((items, skipped))
 }
 
-fn walk(
-    path: &Path,
-    name: &str,
-    opts: &CollectOptions,
-    items: &mut Vec<InputItem>,
-    skipped: &mut Skipped,
-) {
+fn walk(path: &Path, name: &str, opts: &CollectOptions, items: &mut Vec<InputItem>, skipped: &mut Skipped) {
     if opts.masks.excluded(name) {
         return;
     }

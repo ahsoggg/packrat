@@ -1,7 +1,7 @@
 use packrat_core::create::{CreateOptions, Format, create_archive};
 use packrat_core::encoding::NameEncoding;
-use packrat_core::mask::Masks;
 use packrat_core::extract::{self, ExtractOptions, Resolution};
+use packrat_core::mask::Masks;
 use packrat_core::{Archive, EntryKind, OpenOptions, Password, Progress, open, timeutil};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -14,6 +14,11 @@ USAGE:
   packrat-cli extract <archive> [NAMES/MASKS...] [-o DIR] [--smart] [--threads N] [-i MASK] [-x MASK] [--stdout]
                       [--skip | --overwrite | --keep-both] [--accept-risks] [--repair]
                       [--encoding NAME] [PASSWORD OPTIONS]
+  packrat-cli add <archive> <paths...> [-i/-x MASK] [--level N] [PASSWORD OPTIONS]   add files to an archive (7-Zip's `a`);
+                      files with the same name are replaced; creates the archive when it does not exist yet
+  packrat-cli update <archive> <paths...>    like add, but only files newer than the archived ones
+  packrat-cli delete <archive> <names/masks...> [-x MASK]   take files or folders out of an archive
+  packrat-cli rename <archive> <old> <new> [<old> <new>...]   rename files or folders inside an archive
   packrat-cli test <archive> [--sha256] [--threads N] [--encoding NAME] [PASSWORD OPTIONS]
   packrat-cli repair <archive.prat|zip> [-o FIXED]  rebuild damaged areas from the recovery data (the original is kept)
   packrat-cli create <output> <paths...> [--format FMT] [--level N] [--threads N] [-i MASK] [-x MASK]
@@ -26,6 +31,11 @@ USAGE:
 
 FORMATS (create): zip (deflate), zip-zstd, zip-store, 7z, prat, tar, tar.gz, tar.zst, tar.xz, tar.lz4
   The format is taken from the output extension when --format is not given.
+
+CHANGING ARCHIVES: add, update, delete and rename work on ZIP, 7z, prat and TAR (tar.gz/zst/xz/lz4) archives.
+  ZIP is edited in place: what stays is copied as it is, without recompressing, and recovery data and the AES
+  password protection are kept. The other formats are unpacked to a temporary folder and packed again (so this
+  takes as long as creating them). The old file is replaced only when everything succeeded.
 
 MASKS AND LISTS:
   -i MASK / -x MASK (also --include / --exclude, and 7-Zip's -i!MASK / -x!MASK) keep or leave out files by name;
@@ -197,28 +207,8 @@ fn take_masks(args: &mut Args) -> Result<Masks, String> {
     Ok(m)
 }
 
-/// Entries chosen by names (an exact file or folder, or a mask when the name holds `*` or `?`) and by the masks.
 fn select_entries(a: &dyn Archive, wanted: &[String], masks: &Masks) -> Vec<usize> {
-    let mut by_mask = Masks::new();
-    let mut plain = Vec::new();
-    for w in wanted {
-        if w.contains('*') || w.contains('?') {
-            by_mask.include(w);
-        } else {
-            plain.push(w.replace('\\', "/").trim_end_matches('/').to_owned());
-        }
-    }
-    a.entries()
-        .iter()
-        .filter(|e| {
-            let p = e.path.replace('\\', "/");
-            let named = wanted.is_empty()
-                || (by_mask.has_include() && by_mask.allows(&p))
-                || plain.iter().any(|w| p.trim_end_matches('/') == w || p.starts_with(&format!("{w}/")));
-            named && masks.allows(&p)
-        })
-        .map(|e| e.index)
-        .collect()
+    packrat_core::mask::select_entries(a.entries(), wanted, masks)
 }
 
 fn human(n: u64) -> String {
@@ -258,7 +248,11 @@ fn main() -> ExitCode {
     let result = match cmd.as_str() {
         "list" | "l" => cmd_list(args),
         "extract" | "x" => cmd_extract(args),
-        "create" | "c" | "a" => cmd_create(args),
+        "create" | "c" => cmd_create(args, Mode::Create),
+        "add" | "a" => cmd_create(args, Mode::Add),
+        "update" | "u" => cmd_create(args, Mode::Update),
+        "delete" | "d" => cmd_delete(args),
+        "rename" | "rn" => cmd_rename(args),
         "repair" => cmd_repair(args),
         "test" | "t" => cmd_test(args),
         "hash" | "h" => cmd_hash(args),
@@ -510,6 +504,107 @@ fn extract_to_stdout(a: &dyn Archive, wanted: &[String], masks: &Masks) -> Resul
 }
 
 /// Removes `dir` and the empty folders below it.
+#[allow(clippy::too_many_arguments)]
+fn add_to_existing(
+    archive: &std::path::Path,
+    inputs: &[PathBuf],
+    mode: Mode,
+    masks: Masks,
+    recursive: bool,
+    level: Option<usize>,
+    threads: usize,
+    recovery: Option<usize>,
+    password: Option<Password>,
+) -> Result<packrat_core::modify::ModifyReport, String> {
+    use packrat_core::modify::{Change, ModifyOptions, modify_archive};
+    let opts = ModifyOptions {
+        masks,
+        recursive,
+        threads,
+        level: level.map(|l| l.clamp(1, 9) as u32),
+        password,
+        recovery_percent: recovery.map(|r| r.min(100) as u32),
+        ..Default::default()
+    };
+    let change = if mode == Mode::Update {
+        Change::Update(inputs.to_vec())
+    } else {
+        Change::Add(inputs.to_vec())
+    };
+    let started = std::time::Instant::now();
+    let r = modify_archive(archive, &change, &opts, &Progress::new()).map_err(|e| e.to_string())?;
+    println!(
+        "{}: {} added, {} replaced{} -> {} in {:.2} s",
+        archive.display(),
+        r.added,
+        r.replaced,
+        if r.skipped_older > 0 {
+            format!(", {} not newer", r.skipped_older)
+        } else {
+            String::new()
+        },
+        human(r.bytes_out),
+        started.elapsed().as_secs_f64()
+    );
+    Ok(r)
+}
+
+fn cmd_delete(mut args: Args) -> Result<u8, String> {
+    use packrat_core::modify::{Change, ModifyOptions, modify_archive};
+    let oo = open_options(&mut args)?;
+    let masks = take_masks(&mut args)?;
+    let threads = args.number(&["--threads", "-j"])?.unwrap_or(0);
+    args.reject_unknown()?;
+    if args.0.len() < 2 {
+        return Err("delete: need an archive and at least one name or mask".into());
+    }
+    let path = PathBuf::from(args.0.remove(0));
+    let opts = ModifyOptions {
+        masks,
+        threads,
+        password: oo.password,
+        ..Default::default()
+    };
+    let started = std::time::Instant::now();
+    let r =
+        modify_archive(&path, &Change::Delete(args.0.clone()), &opts, &Progress::new()).map_err(|e| e.to_string())?;
+    println!(
+        "{}: {} entries deleted -> {} in {:.2} s",
+        path.display(),
+        r.deleted,
+        human(r.bytes_out),
+        started.elapsed().as_secs_f64()
+    );
+    Ok(0)
+}
+
+fn cmd_rename(mut args: Args) -> Result<u8, String> {
+    use packrat_core::modify::{Change, ModifyOptions, modify_archive};
+    let oo = open_options(&mut args)?;
+    let threads = args.number(&["--threads", "-j"])?.unwrap_or(0);
+    args.reject_unknown()?;
+    if args.0.len() < 3 || args.0.len().is_multiple_of(2) {
+        return Err("rename: need an archive and pairs of OLD NEW names".into());
+    }
+    let path = PathBuf::from(args.0.remove(0));
+    let pairs: Vec<(String, String)> = args.0.chunks(2).map(|c| (c[0].clone(), c[1].clone())).collect();
+    let opts = ModifyOptions {
+        threads,
+        password: oo.password,
+        ..Default::default()
+    };
+    let started = std::time::Instant::now();
+    let r = modify_archive(&path, &Change::Rename(pairs), &opts, &Progress::new()).map_err(|e| e.to_string())?;
+    println!(
+        "{}: {} entries renamed -> {} in {:.2} s",
+        path.display(),
+        r.renamed,
+        human(r.bytes_out),
+        started.elapsed().as_secs_f64()
+    );
+    Ok(0)
+}
+
 fn prune_empty(dir: &std::path::Path) {
     if let Ok(rd) = std::fs::read_dir(dir) {
         for e in rd.flatten() {
@@ -521,7 +616,17 @@ fn prune_empty(dir: &std::path::Path) {
     let _ = std::fs::remove_dir(dir);
 }
 
-fn cmd_create(mut args: Args) -> Result<u8, String> {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// `create`: the archive must not exist.
+    Create,
+    /// `add` (7-Zip's `a`): put files into the archive, creating it when it is not there.
+    Add,
+    /// `update`: like `add`, but only newer files replace archived ones.
+    Update,
+}
+
+fn cmd_create(mut args: Args, mode: Mode) -> Result<u8, String> {
     let no_names = args.flag("--no-encrypt-names");
     let no_filters = args.flag("--no-filters");
     let dict_mb = args.number(&["--dict-mb"])?;
@@ -558,6 +663,39 @@ fn cmd_create(mut args: Args) -> Result<u8, String> {
         None => None,
     };
 
+    if mode != Mode::Create && output.exists() {
+        let result = add_to_existing(
+            &output,
+            &inputs,
+            mode,
+            masks,
+            !no_recursion,
+            level,
+            threads,
+            recovery,
+            oo.password,
+        );
+        if let Some(dir) = &spool {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+        let report = result?;
+        if delete_source {
+            let spooled = spool.as_deref();
+            for f in report
+                .added_files
+                .iter()
+                .filter(|f| !spooled.is_some_and(|d| f.starts_with(d)))
+            {
+                if let Err(e) = std::fs::remove_file(f) {
+                    eprintln!("cannot delete {}: {e}", f.display());
+                }
+            }
+            for d in inputs.iter().filter(|p| p.is_dir()) {
+                prune_empty(d);
+            }
+        }
+        return Ok(0);
+    }
     let lower = output.to_string_lossy().to_ascii_lowercase();
     let format = match format_name {
         Some(n) => Format::from_name(&n).ok_or_else(|| format!("unknown format '{n}'"))?,
@@ -615,7 +753,11 @@ fn cmd_create(mut args: Args) -> Result<u8, String> {
         }
         let mut removed = 0usize;
         let spooled = spool.as_deref();
-        for f in report.added.iter().filter(|f| !spooled.is_some_and(|d| f.starts_with(d))) {
+        for f in report
+            .added
+            .iter()
+            .filter(|f| !spooled.is_some_and(|d| f.starts_with(d)))
+        {
             match std::fs::remove_file(f) {
                 Ok(()) => removed += 1,
                 Err(e) => eprintln!("cannot delete {}: {e}", f.display()),

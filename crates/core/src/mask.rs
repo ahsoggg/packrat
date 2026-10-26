@@ -5,6 +5,8 @@
 //! `*.log` finds logs at any depth. A mask with a `/` is tried against the path from the archive root and against
 //! every leading part of it. Case is ignored.
 
+use crate::entry::Entry;
+
 /// Include and exclude masks. Empty `include` means everything.
 #[derive(Clone, Debug, Default)]
 pub struct Masks {
@@ -105,6 +107,33 @@ impl Masks {
     pub fn allows(&self, path: &str) -> bool {
         !self.excluded(path) && (self.include.is_empty() || self.include.iter().any(|m| m.matches(path)))
     }
+}
+
+/// Entries chosen by names (an exact file or folder, or a mask when the name holds `*` or `?`) and by the masks.
+/// No names means every entry the masks allow.
+pub fn select_entries(entries: &[Entry], wanted: &[String], masks: &Masks) -> Vec<usize> {
+    let mut by_mask = Masks::new();
+    let mut plain = Vec::new();
+    for w in wanted {
+        if w.contains('*') || w.contains('?') {
+            by_mask.include(w);
+        } else {
+            plain.push(w.replace('\\', "/").trim_end_matches('/').to_owned());
+        }
+    }
+    entries
+        .iter()
+        .filter(|e| {
+            let p = e.path.replace('\\', "/");
+            let named = wanted.is_empty()
+                || (by_mask.has_include() && by_mask.allows(&p))
+                || plain
+                    .iter()
+                    .any(|w| p.trim_end_matches('/') == w || p.starts_with(&format!("{w}/")));
+            named && masks.allows(&p)
+        })
+        .map(|e| e.index)
+        .collect()
 }
 
 #[cfg(test)]
