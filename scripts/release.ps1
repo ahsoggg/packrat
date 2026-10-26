@@ -39,6 +39,7 @@ New-Item -ItemType Directory $dist | Out-Null
 Copy-Item target\release\Packrat.exe (Join-Path $dist "Packrat.exe")
 Copy-Item target\release\packrat-cli.exe (Join-Path $dist "packrat-cli.exe")
 Copy-Item target\release\packrat7z.dll (Join-Path $dist "packrat7z.dll")
+Copy-Item target\release\packrat-sfx.exe (Join-Path $dist "packrat-sfx.exe")
 
 $cert = $null
 try { $cert = Get-ChildItem Cert:\CurrentUser\My -CodeSigningCert -ErrorAction Stop | Where-Object { $_.Subject -eq "CN=ahsoggg" } } catch { }
