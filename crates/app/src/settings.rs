@@ -32,6 +32,8 @@ pub struct Settings {
     /// Format name accepted by `Format::from_name`.
     pub default_format: String,
     pub level: u32,
+    /// Recovery data percentage last used in the create dialog.
+    pub recovery: u32,
     pub last_dest: Option<String>,
     /// Open the folder when an extraction ends cleanly.
     pub open_after_extract: bool,
@@ -50,6 +52,7 @@ impl Default for Settings {
             recent: Vec::new(),
             default_format: "zip".into(),
             level: 6,
+            recovery: 0,
             last_dest: None,
             open_after_extract: true,
             delete_after_extract: false,

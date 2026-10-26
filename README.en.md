@@ -4,21 +4,33 @@
 
 An archive manager for Windows (a replacement for 7-Zip + Bandizip + PeaZip): compression and extraction on all
 cores, "smart" extraction without nested `Folder\Folder`, protection against hostile archives, correct names in old
-ZIP files, passwords, and a preview of files right inside the archive. Written in Rust; the only native code is the RAR
-decoder (unrar, see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)).
+ZIP files, passwords, and a preview of files right inside the archive. Written in Rust; the native code is the RAR
+decoder (unrar), libzstd and the SIMD parts of BLAKE3 (see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)).
 
 ![Archive window: tree, sizes, compression ratio and a code preview](docs/screenshots/02-archive-code.png)
 
 *All screenshots were taken with made-up data (`Packrat.exe --demo`) — no real file names appear on them.*
 
-## Features (version 0.5.0)
+## Features (development version; the last release is 0.5.0)
+
+The items marked **new** are in the repository but not in a release yet.
 
 - **Formats.** Read and write: ZIP (store, deflate, zstd) and TAR (including `.tar.gz`, `.tar.zst`, `.tar.xz`,
   `.tar.lz4`). Read: 7z (LZMA2, BZip2 and PPMd verified on 7-Zip archives, other methods through the library), single
-  `.gz`, `.bz2`, `.xz`, `.zst`, `.lz4` files. Creating 7z (LZMA2) works too. Read only: **RAR** (all versions up to 5.x, passwords, volumes open from any
+  `.gz`, `.bz2`, `.xz`, `.zst`, `.lz4` files. Creating **7z** works too (LZMA2 with a dictionary that follows the level, BCJ filters for executables, already-packed files stored as they are, files sorted by type; `--no-filters`, `--dict-mb`, `--solid-mb`). **New:** Packrat's own `.prat` (below). Read only: **RAR** (all versions up to 5.x, passwords, volumes open from any
   part; through the unrar library), **CAB** (MSZIP, LZX, Quantum; single cabinet), **ISO 9660** (Joliet and Rock
   Ridge), **LZH/LHA**, **AR/DEB**, **CPIO** (including `.cpio.gz` and the like) and **RPM**. `.jar`, `.apk`, `.docx`,
   `.epub`, `.cbz` and similar files are ZIP and open the same way.
+- **The `.prat` format (new).** Packrat's own archive, for what ZIP, 7z and RAR cannot do together: files are cut into
+  content-defined chunks and identical chunks are stored once (copies, backups and versions of one project shrink a
+  lot, and a few bytes inserted in front of a file do not make the rest "new"); data is packed into zstd blocks that
+  still open one file without decoding everything before it; every block carries a BLAKE3 hash. Optional **password
+  encryption** (Argon2id, XChaCha20-Poly1305; names, sizes and the index are encrypted too) and optional
+  **recovery data** (Reed-Solomon) that rebuilds damaged areas. `packrat-cli create out.prat dir --format prat
+  [--level N] [--recovery PCT] [--ask-password]`. Layout and security notes: [docs/PRAT_FORMAT.md](docs/PRAT_FORMAT.md).
+  **7-Zip opens `.prat`** (list, test, extract, password prompt) once the plugin `packrat7z.dll` is in its `Formats`
+  folder: [docs/SEVENZIP_PLUGIN.md](docs/SEVENZIP_PLUGIN.md). WinRAR cannot load third-party formats; for it, a ZIP with
+  recovery data is the way (below).
 - **All cores.** ZIP entries and blocks of large files are compressed in parallel (deflate in independent blocks
   like pigz, zstd and lz4 in independent frames, 7z in parallel LZMA2 blocks, xz in its own blocks). Independent ZIP
   entries are extracted in parallel. The thread count is configurable (`--threads N`, Settings). Measured speed-ups:
@@ -43,11 +55,16 @@ decoder (unrar, see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)).
   (a bare `.gz` and the like), the limits are enforced while unpacking. No entry can produce more bytes than its
   header declares.
 - **Passwords.** ZIP: AES-256 (WinZip AE-2) read and write; the old ZipCrypto is read-only and comes with a warning
-  about its weakness. 7z: AES-256, including encrypted file names (read and write). The password is never stored,
+  about its weakness. 7z: AES-256, including encrypted file names (read and write). `.prat`: XChaCha20-Poly1305 with a
+  key from Argon2id (new). The password is never stored,
   never logged and never on the command line (CLI: `--ask-password`, `--password-file` or `PACKRAT_PASSWORD`).
   Compatibility with 7-Zip 26.01 was tested in both directions.
 - **Explorer.** A "Packrat" menu for archives (open, extract here, extract to folder, test) and for any file (add to `.zip`, `.7z`, `.tar.zst`, custom name). A multi-selection (files or archives) opens one window: files go into one archive, archives are extracted one after another with a single summary. “Send to” → “Packrat — to archive” does the same. On Windows 11 the menu is under “Show more options”; Settings has a switch for the classic menu (undone by unticking, Explorer must restart). Associations for `.zip`, `.7z`, `.tar` and others are switched on and rolled back in Settings; no administrator rights needed.
 - **Verify and repair.** "Test integrity" (CRC and SHA-256), `packrat-cli test`. A damaged or truncated ZIP is read from its local headers (`extract --repair`); partly extracted files are kept. On "access denied" you can retry as administrator.
+  **New:** `--recovery PCT` adds Reed-Solomon recovery data to `.prat` and to ordinary **ZIP** files (a ZIP with it is
+  still a normal ZIP that 7-Zip, Explorer and others open); `packrat-cli repair archive` writes a repaired copy that is
+  byte-for-byte what was written, never touching the damaged original, and needs no password for encrypted `.prat`
+  ([docs/ZIP_RECOVERY.md](docs/ZIP_RECOVERY.md)).
 - **Preview without extracting.** Select a file and its content appears on the right: images (PNG, JPEG, GIF, BMP,
   WebP) as a thumbnail with a full-size view, text and code with syntax highlighting, a hex view for the rest. For
   ZIP only the needed entry is read (a test counts the bytes read); for TAR and solid 7z the archive is read up to the
@@ -55,8 +72,8 @@ decoder (unrar, see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)).
   16 MB, hex 4 KB).
 - **Window.** Content tree (name, size, compression, date, method), sorting, multi-selection, extraction by button
   or by dragging the selection into Explorer, dropping an archive or files onto the window. Russian and English UI.
-- **Command line.** `packrat-cli list | extract | create`, `--smart`, `--threads N`, `--encoding`, `--accept-risks`,
-  passwords.
+- **Command line.** `packrat-cli list | extract | create | test | repair`, `--smart`, `--threads N`, `--encoding`,
+  `--accept-risks`, passwords. Unknown options are refused (`--password abc` is not taken for a file name).
 - **Auto-update.** Once a day one request to `api.github.com`; an "Update" button, SHA-256 check against
   `SHA256SUMS.txt`, file replacement and restart; `Packrat.exe --update` does the same without a window. It can be
   turned off in Settings.
@@ -113,6 +130,7 @@ Layout:
 - `crates/core` — formats, smart extraction, safety checks, encodings, passwords, preview, tests (no UI);
 - `crates/app` — egui GUI, installer, auto-update, diagnostics, demo mode;
 - `crates/cli` — `packrat-cli`;
+- `crates/sevenzip-plugin` — `packrat7z.dll`, the 7-Zip plugin for `.prat` (`scripts\install_7zip_plugin.ps1` installs it);
 - `scripts/` — release build, measurements, certificate; `docs/` — measurements, release notes, screenshots.
 
 The same exe is an installer when it is named `Packrat-Setup.exe` (or started with `--install`) and an
@@ -133,14 +151,19 @@ Packrat.exe --screenshots docs\screenshots
   can produce more bytes than declared.
 - ZIP AES: AES-256 is verified (what 7-Zip and Packrat write); reading AES-128/192 is implemented but not tested.
   ZipCrypto passwords are taken as UTF-8; only ASCII was tested. TAR cannot be encrypted.
-- zstd compression is pure Rust (`ruzstd`) with a single level (about `zstd -1`).
+- zstd compression uses libzstd (levels 1–9 of the slider, up to zstd 19); decoding is pure Rust (`ruzstd`).
 - The listing of `.tar.*` files is built with one pass over the whole archive; for big archives it is not instant.
-  7z is created with LZMA2 only. `.tar.lz4` files do not open in stock 7-Zip (it has no LZ4).
+  7z is created with LZMA2 only (plus BCJ and copy for parts of the data); on large source trees its size is a few percent above 7-Zip's at the same level. `.tar.lz4` files do not open in stock 7-Zip (it has no LZ4).
 - Preview: images over 16 MB and files more than 256 MB into a streaming archive are not shown (extraction is
   suggested instead). Highlighting uses syntect's default language set.
 - Dragging files from the window into Explorer: the data object is covered by a test, but the mouse gesture itself
   has not been verified automatically on a real system.
-- The Explorer menu and associations were checked in an isolated registry hive, not in a live Explorer. Repair of a damaged archive works for ZIP only.
+- The Explorer menu and associations were checked in an isolated registry hive, not in a live Explorer. A damaged ZIP without recovery data is read from its local headers; with Packrat's recovery data (ZIP and `.prat`) it is rebuilt exactly, up to the amount of recovery data. The GUI creates `.prat` and recovery data, but repair is a command-line action (`packrat-cli repair`).
+
+- `.prat` is new: only Packrat and the 7-Zip plugin read it (the plugin is read-only and 64-bit, tested with 7-Zip 26.01),
+  there are no multi-volume archives, blocks are zstd only, and the encryption has not been audited by anyone but
+  its tests ([docs/PRAT_FORMAT.md](docs/PRAT_FORMAT.md) describes what it protects and what stays visible). A ZIP with
+  recovery data was checked with 7-Zip, Python and .NET; WinRAR was not available for a test.
 
 ## License
 

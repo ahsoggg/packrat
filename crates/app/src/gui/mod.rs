@@ -149,6 +149,8 @@ pub(crate) struct CreateDialog {
     pub items: Vec<PathBuf>,
     pub format: usize,
     pub level: u32,
+    /// Percent of recovery data for ZIP and .prat; 0 = none.
+    pub recovery: u32,
     pub output: String,
     pub output_edited: bool,
 }
@@ -181,10 +183,11 @@ pub(crate) enum UpdateMsg {
     Downloaded(Result<PathBuf, String>),
 }
 
-pub(crate) const FORMATS: [(Key, &str); 7] = [
+pub(crate) const FORMATS: [(Key, &str); 8] = [
     (Key::FormatZip, "zip"),
     (Key::FormatZipZstd, "zip-zstd"),
     (Key::Format7z, "7z"),
+    (Key::FormatPrat, "prat"),
     (Key::FormatTarZst, "tar.zst"),
     (Key::FormatTarLz4, "tar.lz4"),
     (Key::FormatTarGz, "tar.gz"),
@@ -540,6 +543,7 @@ impl App {
             "zip" => Format::Zip(ZipMethod::Deflate),
             "zip-zstd" => Format::Zip(ZipMethod::Zstd),
             "7z" => Format::SevenZ,
+            "prat" => Format::Prat,
             "tar.zst" => Format::Tar(Compression::Zst),
             "tar.lz4" => Format::Tar(Compression::Lz4),
             "tar.gz" => Format::Tar(Compression::Gz),
@@ -772,6 +776,85 @@ mod tests {
                 .iter()
                 .any(|e| e.path == "data.txt")
         );
+    }
+
+    #[test]
+    fn a_prat_archive_with_a_password_and_recovery_data_is_made_and_remembered() {
+        crate::settings::use_test_data_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("secret.txt");
+        std::fs::write(&file, "classified ".repeat(5_000)).unwrap();
+        let ctx = egui::Context::default();
+        let mut app = App::new(
+            &ctx,
+            StartOptions {
+                open: vec![],
+                demo: true,
+                screenshots: None,
+                action: StartAction::None,
+            },
+        );
+        app.demo = false;
+        app.begin_create(vec![file]);
+        let out = dir.path().join("secret.prat");
+        {
+            let c = app.create.as_mut().unwrap();
+            c.format = FORMATS.iter().position(|(_, n)| *n == "prat").unwrap();
+            c.password = "pw-123".into();
+            c.recovery = 8;
+            c.output = out.to_string_lossy().into_owned();
+            c.output_edited = true;
+        }
+        app.start_create_for_test(&ctx);
+        wait_for_job(&mut app, &ctx);
+        assert!(
+            app.result.as_ref().is_some_and(|r| r.ok),
+            "{:?}",
+            app.result.as_ref().map(|r| &r.lines)
+        );
+        // encrypted: nothing opens without the password, and it opens with it
+        assert!(matches!(
+            packrat_core::open::open(&out).err(),
+            Some(packrat_core::Error::PasswordRequired)
+        ));
+        let opened = packrat_core::open::open_with(&out, &OpenOptions::default().with_password("pw-123")).unwrap();
+        assert!(opened.entries().iter().any(|e| e.path == "secret.txt"));
+        // the recovery data is there, and the choice is remembered for the next time
+        assert!(packrat_core::prat::recover::recovery_info(&out).is_some());
+        assert_eq!(app.settings.recovery, 8);
+        assert_eq!(app.settings.default_format, "prat");
+    }
+
+    #[test]
+    fn recovery_is_not_added_to_formats_that_cannot_hold_it() {
+        crate::settings::use_test_data_dir();
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("data.txt");
+        std::fs::write(&file, "x".repeat(10_000)).unwrap();
+        let ctx = egui::Context::default();
+        let mut app = App::new(
+            &ctx,
+            StartOptions {
+                open: vec![],
+                demo: true,
+                screenshots: None,
+                action: StartAction::None,
+            },
+        );
+        app.demo = false;
+        app.begin_create(vec![file]);
+        let out = dir.path().join("data.7z");
+        {
+            let c = app.create.as_mut().unwrap();
+            c.format = FORMATS.iter().position(|(_, n)| *n == "7z").unwrap();
+            c.recovery = 10; // left over from a previous choice: must be ignored for 7z, not make the job fail
+            c.output = out.to_string_lossy().into_owned();
+            c.output_edited = true;
+        }
+        app.start_create_for_test(&ctx);
+        wait_for_job(&mut app, &ctx);
+        assert!(app.result.as_ref().is_some_and(|r| r.ok));
+        assert!(out.exists());
     }
 
     fn app_with(ctx: &egui::Context, path: PathBuf) -> App {

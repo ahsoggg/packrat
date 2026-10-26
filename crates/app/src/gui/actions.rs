@@ -65,6 +65,8 @@ impl App {
             items,
             format: idx,
             level: self.settings.level.clamp(1, 9),
+            // the quick actions of the Explorer menu never add recovery data on their own
+            recovery: 0,
             output: output.to_string_lossy().into_owned(),
             output_edited: true,
         });

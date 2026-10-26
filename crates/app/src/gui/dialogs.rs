@@ -266,6 +266,7 @@ impl App {
                     items,
                     format,
                     level: self.settings.level.clamp(1, 9),
+                    recovery: self.settings.recovery.min(30),
                     output: String::new(),
                     output_edited: false,
                 });
@@ -292,8 +293,14 @@ impl App {
         let is_tar = matches!(opts.format, packrat_core::create::Format::Tar(_));
         opts.password = (!c.password.is_empty() && !is_tar).then(|| Password::new(&c.password));
         opts.encrypt_names = c.encrypt_names;
+        let can_repair = matches!(
+            opts.format,
+            packrat_core::create::Format::Prat | packrat_core::create::Format::Zip(_)
+        );
+        opts.recovery_percent = if can_repair { c.recovery.min(30) } else { 0 };
         self.settings.default_format = FORMATS[c.format].1.to_owned();
         self.settings.level = c.level;
+        self.settings.recovery = c.recovery.min(30);
         self.save_settings();
         self.create = None;
         diag::info(&format!(
@@ -543,9 +550,29 @@ impl App {
             if is_tar {
                 c.password.clear();
             }
+            let can_repair = matches!(
+                fmt,
+                packrat_core::create::Format::Prat | packrat_core::create::Format::Zip(_)
+            );
+            ui.add_enabled_ui(can_repair, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(t(Key::CreateRecovery));
+                    ui.add(egui::Slider::new(&mut c.recovery, 0..=30));
+                });
+            });
+            if can_repair {
+                ui.label(theme::dim(t(Key::CreateRecoveryHint)));
+            }
+            if matches!(fmt, packrat_core::create::Format::Prat) {
+                ui.label(theme::dim(t(Key::CreatePratNote)));
+            }
             ui.add_enabled_ui(!is_tar, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(t(Key::CreatePassword));
+                    ui.label(t(if matches!(fmt, packrat_core::create::Format::Prat) {
+                        Key::CreatePasswordPrat
+                    } else {
+                        Key::CreatePassword
+                    }));
                     ui.add(
                         egui::TextEdit::singleline(&mut c.password)
                             .password(true)

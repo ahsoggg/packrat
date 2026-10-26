@@ -15,17 +15,17 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// Formats Packrat takes over when the user asks for associations.
-pub const ARCHIVE_EXTS: [&str; 20] = [
-    "zip", "7z", "rar", "tar", "gz", "tgz", "bz2", "tbz2", "tbz", "xz", "txz", "zst", "tzst", "lz4", "cab", "lzh",
-    "lha", "cpio", "deb", "rpm",
+pub const ARCHIVE_EXTS: [&str; 21] = [
+    "zip", "7z", "prat", "rar", "tar", "gz", "tgz", "bz2", "tbz2", "tbz", "xz", "txz", "zst", "tzst", "lz4", "cab",
+    "lzh", "lha", "cpio", "deb", "rpm",
 ];
 /// Archives that get the Explorer menu but are never associated: Windows opens them itself (mounts an image).
 const MENU_ONLY_EXTS: [&str; 1] = ["iso"];
 /// Everything the "Open archive" dialog offers: the above plus formats that are ZIP or AR inside.
-pub const OPEN_EXTS: [&str; 33] = [
-    "zip", "7z", "rar", "tar", "gz", "tgz", "bz2", "tbz2", "tbz", "xz", "txz", "zst", "tzst", "lz4", "cab", "lzh",
-    "lha", "cpio", "deb", "rpm", "iso", "ar", "a", "jar", "war", "apk", "xpi", "whl", "nupkg", "vsix", "epub", "cbz",
-    "cbr",
+pub const OPEN_EXTS: [&str; 34] = [
+    "zip", "7z", "prat", "rar", "tar", "gz", "tgz", "bz2", "tbz2", "tbz", "xz", "txz", "zst", "tzst", "lz4", "cab",
+    "lzh", "lha", "cpio", "deb", "rpm", "iso", "ar", "a", "jar", "war", "apk", "xpi", "whl", "nupkg", "vsix", "epub",
+    "cbz", "cbr",
 ];
 
 fn menu_exts() -> impl Iterator<Item = &'static str> {

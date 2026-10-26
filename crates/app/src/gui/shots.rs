@@ -124,7 +124,8 @@ fn setup(app: &mut App, ctx: &egui::Context, step: usize) {
             ]);
             if let Some(c) = app.create.as_mut() {
                 c.level = 6;
-                c.format = 2; // 7z
+                c.format = super::FORMATS.iter().position(|(_, n)| *n == "prat").unwrap_or(2);
+                c.recovery = 5;
                 c.password = "пароль-на-архив".into();
             }
         }
