@@ -3,7 +3,7 @@
 
 use super::deflate;
 use super::zstd::{self, ZstdReader};
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::par::{OrderedPool, resolve_threads};
 use std::io::{self, BufReader, Read, Write};
 use std::num::NonZeroU64;
@@ -81,9 +81,17 @@ impl<W: Write + Send> FinishWrite for Plain<W> {
 
 #[derive(Clone, Copy)]
 enum BlockKind {
-    Gzip { level: u32 },
-    Zstd { level: u32 },
+    Gzip {
+        level: u32,
+    },
+    Zstd {
+        level: u32,
+    },
     Lz4,
+    /// Independent bzip2 streams one after another: a valid multi-stream file that every reader accepts.
+    Bzip2 {
+        level: u32,
+    },
 }
 
 struct Encoded {
@@ -124,6 +132,14 @@ fn encode(kind: BlockKind, chunk: &[u8]) -> Encoded {
     let data = match kind {
         BlockKind::Gzip { level } => deflate::compress_block(chunk, level, false),
         BlockKind::Zstd { level } => zstd::compress_frame_level(chunk, zstd::zstd_level(level)),
+        BlockKind::Bzip2 { level } => {
+            let mut enc = bzip2::write::BzEncoder::new(
+                Vec::with_capacity(chunk.len() / 3 + 64),
+                bzip2::Compression::new(level.clamp(1, 9)),
+            );
+            enc.write_all(chunk).expect("writing to memory");
+            enc.finish().expect("finishing a stream in memory")
+        }
         BlockKind::Lz4 => {
             let info = lz4_flex::frame::FrameInfo::new().block_size(lz4_flex::frame::BlockSize::Max1MB);
             let mut enc =
@@ -147,7 +163,7 @@ impl<W: Write + Send + 'static> ParWriter<W> {
         }
         let block_size = match kind {
             BlockKind::Gzip { .. } => 1 << 20,
-            BlockKind::Zstd { .. } | BlockKind::Lz4 => 4 << 20,
+            BlockKind::Zstd { .. } | BlockKind::Lz4 | BlockKind::Bzip2 { .. } => 4 << 20,
         };
         Ok(Self {
             out: Out {
@@ -205,7 +221,9 @@ impl<W: Write + Send + 'static> FinishWrite for ParWriter<W> {
                 out.inner.write_all(&(out.total as u32).to_le_bytes())?;
             }
             BlockKind::Zstd { .. } if !out.wrote_anything => out.inner.write_all(&zstd::compress_frame(b""))?,
-            BlockKind::Lz4 if !out.wrote_anything => out.inner.write_all(&encode(kind, b"").data)?,
+            BlockKind::Lz4 | BlockKind::Bzip2 { .. } if !out.wrote_anything => {
+                out.inner.write_all(&encode(kind, b"").data)?
+            }
             _ => {}
         }
         out.inner.flush()?;
@@ -257,7 +275,13 @@ pub fn writer<W: Write + Send + 'static>(
             let w = lzma_rust2::XzWriterMt::new(out, opts, resolve_threads(threads) as u32)?;
             Box::new(XzOut(w))
         }
-        Compression::Bz2 => return Err(Error::Unsupported("writing bzip2 is not supported".into())),
+        Compression::Bz2 => Box::new(ParWriter::new(
+            out,
+            BlockKind::Bzip2 {
+                level: level.clamp(1, 9),
+            },
+            threads,
+        )?),
     })
 }
 
@@ -294,7 +318,13 @@ mod tests {
     fn every_writer_roundtrips_through_its_reader() {
         for size in [0usize, 1, 1000, 4_500_000] {
             let data = sample(size);
-            for c in [Compression::Gz, Compression::Zst, Compression::Lz4, Compression::Xz] {
+            for c in [
+                Compression::Gz,
+                Compression::Zst,
+                Compression::Lz4,
+                Compression::Xz,
+                Compression::Bz2,
+            ] {
                 for threads in [1, 3] {
                     let sink = Shared::default();
                     let mut w = writer(c, sink.clone(), 4, threads).unwrap();

@@ -11,7 +11,7 @@ decoder (unrar), libzstd and the SIMD parts of BLAKE3 (see [THIRD_PARTY_NOTICES.
 
 *All screenshots were taken with made-up data (`Packrat.exe --demo`) — no real file names appear on them.*
 
-## Features (development version; the last release is 0.5.0)
+## Features (version 0.6.0)
 
 The items marked **new** are in the repository but not in a release yet.
 

@@ -13,7 +13,7 @@ use crate::tar;
 use crate::volume;
 use crate::zip::{self, ZipMethod, ZipOptions};
 use std::fs::{self, File};
-use std::io::BufWriter;
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -24,6 +24,8 @@ pub enum Format {
     Prat,
     /// TAR, optionally compressed: gz, zstd, xz or lz4.
     Tar(Compression),
+    /// One file compressed on its own: `.gz`, `.xz`, `.bz2`, `.zst`, `.lz4`.
+    Single(Compression),
 }
 
 impl Format {
@@ -39,6 +41,7 @@ impl Format {
             Format::Tar(Compression::Xz) => "tar.xz",
             Format::Tar(Compression::Lz4) => "tar.lz4",
             Format::Tar(Compression::Bz2) => "tar.bz2",
+            Format::Single(c) => c.extension(),
         }
     }
 
@@ -54,6 +57,12 @@ impl Format {
             "tar.zst" | "tzst" => Format::Tar(Compression::Zst),
             "tar.xz" | "txz" => Format::Tar(Compression::Xz),
             "tar.lz4" => Format::Tar(Compression::Lz4),
+            "tar.bz2" | "tbz2" | "tbz" => Format::Tar(Compression::Bz2),
+            "gz" => Format::Single(Compression::Gz),
+            "xz" => Format::Single(Compression::Xz),
+            "bz2" => Format::Single(Compression::Bz2),
+            "zst" => Format::Single(Compression::Zst),
+            "lz4" => Format::Single(Compression::Lz4),
             _ => return None,
         })
     }
@@ -84,6 +93,12 @@ pub struct CreateOptions {
     pub masks: Masks,
     /// false: folders contribute only the files directly inside them.
     pub recursive: bool,
+    /// 7z only: the compression method (`None`: LZMA2).
+    pub sevenz_method: Option<sevenz::SevenZMethod>,
+    /// 7z only: delta filter distance for data files.
+    pub delta: Option<u32>,
+    /// 7z only: LZMA `fb` (nice length).
+    pub fast_bytes: Option<u32>,
     /// Cut the finished archive into volumes of this many bytes (`name.ext.001`, `.002`, ...).
     pub volume_bytes: Option<u64>,
     /// Make a self-extracting program (`name.exe`) out of the archive.
@@ -108,6 +123,9 @@ impl CreateOptions {
             kdf_mib: None,
             masks: Masks::new(),
             recursive: true,
+            sevenz_method: None,
+            delta: None,
+            fast_bytes: None,
             volume_bytes: None,
             sfx: false,
             sfx_stub: None,
@@ -228,6 +246,9 @@ fn write_to(output: &Path, items: &[InputItem], opts: &CreateOptions, progress: 
         }
         Format::SevenZ => {
             let sopts = SevenZOptions {
+                method: opts.sevenz_method.unwrap_or_default(),
+                delta: opts.delta,
+                fast_bytes: opts.fast_bytes,
                 level: opts.level,
                 threads: opts.threads,
                 password: opts.password.clone(),
@@ -255,6 +276,37 @@ fn write_to(output: &Path, items: &[InputItem], opts: &CreateOptions, progress: 
             if opts.recovery_percent > 0 {
                 prat::recover::add_recovery(output, opts.recovery_percent)?;
             }
+        }
+        Format::Single(_) if opts.password.is_some() => {
+            return Err(Error::Unsupported(
+                "a single compressed file cannot be encrypted: use ZIP or 7z".into(),
+            ));
+        }
+        Format::Single(c) => {
+            let files: Vec<&InputItem> = items.iter().filter(|i| !i.is_dir).collect();
+            if files.len() != 1 || items.iter().any(|i| i.is_dir) {
+                return Err(Error::Other(format!(
+                    ".{} holds exactly one file; use .tar.{} for several",
+                    c.extension(),
+                    c.extension()
+                )));
+            }
+            let mut w =
+                crate::codec::stream::writer(c, BufWriter::with_capacity(256 << 10, file), opts.level, opts.threads)?;
+            let mut src = File::open(&files[0].disk_path)?;
+            progress.set_totals(1, files[0].size);
+            let mut buf = vec![0u8; 1 << 20];
+            loop {
+                progress.check()?;
+                let n = std::io::Read::read(&mut src, &mut buf)?;
+                if n == 0 {
+                    break;
+                }
+                w.write_all(&buf[..n])?;
+                progress.add_bytes(n as u64);
+            }
+            progress.add_file();
+            w.finish()?;
         }
         Format::Tar(_) if opts.password.is_some() => {
             return Err(Error::Unsupported(

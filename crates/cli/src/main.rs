@@ -22,14 +22,15 @@ USAGE:
   packrat-cli test <archive> [--sha256] [--threads N] [--encoding NAME] [PASSWORD OPTIONS]
   packrat-cli repair <archive.prat|zip> [-o FIXED]  rebuild damaged areas from the recovery data (the original is kept)
   packrat-cli create <output> <paths...> [--format FMT] [--level N] [--threads N] [-i MASK] [-x MASK]
-                      [--no-recursion] [--delete-source] [--stdin NAME] [--volume SIZE] [--sfx]
+                      [--no-recursion] [--delete-source] [--stdin NAME] [--volume SIZE] [--sfx] [--method M] [--delta N] [--fb N]
                       [PASSWORD OPTIONS] [--no-encrypt-names] [--no-filters] [--dict-mb N] [--solid-mb N] [--recovery PCT] [--kdf-mb N]
   packrat-cli hash <files...> [--algo crc32|sha1|sha256|blake3]   checksums of files
   packrat-cli bench [--mb N]               speed of the compressors on generated data in memory (default 16 MiB)
   packrat-cli bench-gen <dir> [--mb N]     write the deterministic data set used by scripts/bench.ps1
   packrat-cli --version | --help
 
-FORMATS (create): zip (deflate), zip-zstd, zip-store, 7z, prat, tar, tar.gz, tar.zst, tar.xz, tar.lz4
+FORMATS (create): zip (deflate), zip-zstd, zip-store, 7z, prat, tar, tar.gz, tar.zst, tar.xz, tar.bz2, tar.lz4,
+  and gz, xz, bz2, zst, lz4 for one single file
   The format is taken from the output extension when --format is not given.
 
 CHANGING ARCHIVES: add, update, delete and rename work on ZIP, 7z, prat and TAR (tar.gz/zst/xz/lz4) archives.
@@ -46,6 +47,9 @@ MASKS AND LISTS:
   any of them (or the .001) and Packrat reads the series, as does 7-Zip. --sfx makes a self-extracting program
   (an .exe that unpacks itself; 7z unless --format says otherwise) from the packrat-sfx.exe stub that sits next
   to packrat-cli.exe; add --volume to split it as well.
+  --method M (7z): lzma2 (default), lzma, ppmd (best on text and logs, slow both ways), bzip2, deflate, copy.
+  --delta N (7z) puts a delta filter of distance N in front of data files (tables, uncompressed audio and
+  images: N is the size of one sample or pixel in bytes); --fb N sets the LZMA word size (5-273).
   --no-recursion (7-Zip's -r-) adds only the files directly inside the given folders; --delete-source (-sdel)
   deletes the added files after the archive was written. --stdin NAME stores what arrives on standard input as
   the file NAME; extract --stdout (-so) writes the contents of the chosen files to standard output.
@@ -645,6 +649,9 @@ fn cmd_create(mut args: Args, mode: Mode) -> Result<u8, String> {
     let delete_source = args.flag("--delete-source");
     let stdin_name = args.value(&["--stdin"])?;
     let sfx = args.flag("--sfx");
+    let method = args.value(&["--method", "-m"])?;
+    let delta = args.number(&["--delta"])?;
+    let fast_bytes = args.number(&["--fb"])?;
     let volume = args
         .value(&["--volume", "-v"])?
         .map(|v| {
@@ -712,7 +719,8 @@ fn cmd_create(mut args: Args, mode: Mode) -> Result<u8, String> {
     let format = match format_name {
         Some(n) => Format::from_name(&n).ok_or_else(|| format!("unknown format '{n}'"))?,
         None => [
-            "tar.gz", "tar.zst", "tar.xz", "tar.lz4", "tgz", "tzst", "txz", "tar", "7z", "zip",
+            "tar.gz", "tar.zst", "tar.xz", "tar.lz4", "tar.bz2", "tgz", "tzst", "txz", "tbz2", "tar", "7z", "prat",
+            "gz", "xz", "bz2", "zst", "lz4", "zip",
         ]
         .iter()
         .find(|e| lower.ends_with(&format!(".{e}")))
@@ -725,6 +733,21 @@ fn cmd_create(mut args: Args, mode: Mode) -> Result<u8, String> {
     };
     let mut opts = CreateOptions::new(format);
     opts.sfx = sfx;
+    if let Some(m) = &method {
+        if format == Format::SevenZ {
+            opts.sevenz_method = Some(
+                packrat_core::sevenz::SevenZMethod::from_name(m)
+                    .ok_or_else(|| format!("unknown 7z method '{m}' (lzma2, lzma, ppmd, bzip2, deflate, copy)"))?,
+            );
+        } else {
+            return Err("--method applies to 7z archives".into());
+        }
+    }
+    if (delta.is_some() || fast_bytes.is_some()) && format != Format::SevenZ {
+        return Err("--delta and --fb apply to 7z archives".into());
+    }
+    opts.delta = delta.map(|d| d.clamp(1, 256) as u32);
+    opts.fast_bytes = fast_bytes.map(|f| f.clamp(5, 273) as u32);
     opts.volume_bytes = volume;
     if let Some(l) = level {
         opts.level = l.clamp(1, 9) as u32;

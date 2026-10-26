@@ -2133,7 +2133,7 @@ dependencies = [
 
 [[package]]
 name = "packrat-7zip-plugin"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "packrat-core",
  "tempfile",
@@ -2142,7 +2142,7 @@ dependencies = [
 
 [[package]]
 name = "packrat-app"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "eframe",
  "egui_extras",
@@ -2164,7 +2164,7 @@ dependencies = [
 
 [[package]]
 name = "packrat-cli"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "blake3",
  "crc32fast",
@@ -2178,7 +2178,7 @@ dependencies = [
 
 [[package]]
 name = "packrat-core"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "aes",
  "argon2",
@@ -2214,7 +2214,7 @@ dependencies = [
 
 [[package]]
 name = "packrat-sfx"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "packrat-core",
  "tempfile",

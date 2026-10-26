@@ -11,7 +11,10 @@ use crate::par::OrderedPool;
 use crate::progress::Progress;
 use crate::source::{SharedSource, SourceReader};
 use crate::timeutil;
-use sevenz_rust2::encoder_options::{AesEncoderOptions, EncoderOptions, Lzma2Options};
+use sevenz_rust2::encoder_options::{
+    AesEncoderOptions, Bzip2Options, DeflateOptions, DeltaOptions, EncoderOptions, Lzma2Options, LzmaOptions,
+    PpmdOptions,
+};
 use sevenz_rust2::{ArchiveEntry, BlockDecoder, EncoderConfiguration, EncoderMethod, NtTime, Password};
 use std::io::{self, Read, Seek, Write};
 use std::sync::Arc;
@@ -220,8 +223,41 @@ impl Archive for SevenZArchive {
     }
 }
 
+/// The compression method of a 7z archive (the filters and `Copy` for packed data are chosen separately).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SevenZMethod {
+    #[default]
+    Lzma2,
+    Lzma,
+    /// Best on text and logs; slow both ways and symmetric.
+    Ppmd,
+    Bzip2,
+    Deflate,
+    Copy,
+}
+
+impl SevenZMethod {
+    pub fn from_name(name: &str) -> Option<Self> {
+        Some(match name.to_ascii_lowercase().as_str() {
+            "lzma2" => Self::Lzma2,
+            "lzma" => Self::Lzma,
+            "ppmd" => Self::Ppmd,
+            "bzip2" | "bz2" => Self::Bzip2,
+            "deflate" => Self::Deflate,
+            "copy" | "store" => Self::Copy,
+            _ => return None,
+        })
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct SevenZOptions {
+    /// What compresses the data (default LZMA2).
+    pub method: SevenZMethod,
+    /// Delta filter distance 1..=256 in front of the compressor for data files (tables, audio, images).
+    pub delta: Option<u32>,
+    /// LZMA/LZMA2 `fb` (nice length, 5..=273).
+    pub fast_bytes: Option<u32>,
     /// LZMA2 level 1..=9 (memory per worker grows quickly above 7).
     pub level: u32,
     pub threads: usize,
@@ -241,6 +277,9 @@ pub struct SevenZOptions {
 impl Default for SevenZOptions {
     fn default() -> Self {
         Self {
+            method: SevenZMethod::Lzma2,
+            delta: None,
+            fast_bytes: None,
             level: 5,
             threads: 0,
             dict_bytes: None,
@@ -409,11 +448,37 @@ pub fn write_7z<W: Write + Seek>(out: W, items: &[InputItem], opts: &SevenZOptio
         Lzma2Options::from_level(level)
     };
     lzma.set_dictionary_size(dict);
-    let lzma_conf = EncoderConfiguration::new(EncoderMethod::LZMA2).with_options(EncoderOptions::Lzma2(lzma));
+    if let Some(fb) = opts.fast_bytes {
+        lzma.set_nice_len(fb.clamp(5, 273));
+    }
+    let lzma_conf = match opts.method {
+        SevenZMethod::Lzma2 => {
+            EncoderConfiguration::new(EncoderMethod::LZMA2).with_options(EncoderOptions::Lzma2(lzma))
+        }
+        SevenZMethod::Lzma => {
+            let mut o = LzmaOptions::from_level(level);
+            o.set_dictionary_size(dict);
+            if let Some(fb) = opts.fast_bytes {
+                o.set_nice_len(fb.clamp(5, 273));
+            }
+            EncoderConfiguration::new(EncoderMethod::LZMA).with_options(EncoderOptions::Lzma(o))
+        }
+        SevenZMethod::Ppmd => EncoderConfiguration::new(EncoderMethod::PPMD)
+            .with_options(EncoderOptions::Ppmd(PpmdOptions::from_level(level))),
+        SevenZMethod::Bzip2 => EncoderConfiguration::new(EncoderMethod::BZIP2)
+            .with_options(EncoderOptions::Bzip2(Bzip2Options::from_level(level))),
+        SevenZMethod::Deflate => EncoderConfiguration::new(EncoderMethod::DEFLATE)
+            .with_options(EncoderOptions::Deflate(DeflateOptions::from_level(level))),
+        SevenZMethod::Copy => EncoderConfiguration::new(EncoderMethod::COPY),
+    };
+    let delta_conf = opts.delta.map(|d| {
+        EncoderConfiguration::new(EncoderMethod::DELTA_FILTER)
+            .with_options(EncoderOptions::Delta(DeltaOptions::from_distance(d.clamp(1, 256))))
+    });
     // The chain lists the stage nearest the file first. Data flows through it from the end: filter, then LZMA2,
     // then AES (as 7-Zip writes it). Every block gets its own random IV and salt.
     let chain_for_block = {
-        let (lzma_conf, password) = (lzma_conf.clone(), opts.password.clone());
+        let (lzma_conf, delta_conf, password) = (lzma_conf.clone(), delta_conf.clone(), opts.password.clone());
         move |class: Class| -> Arc<Vec<EncoderConfiguration>> {
             let mut chain = Vec::with_capacity(3);
             if let Some(p) = &password {
@@ -421,7 +486,10 @@ pub fn write_7z<W: Write + Seek>(out: W, items: &[InputItem], opts: &SevenZOptio
             }
             match class {
                 Class::Packed => chain.push(EncoderConfiguration::new(EncoderMethod::COPY)),
-                Class::Data => chain.push(lzma_conf.clone()),
+                Class::Data => {
+                    chain.push(lzma_conf.clone());
+                    chain.extend(delta_conf.clone());
+                }
                 Class::Code(bcj) => {
                     chain.push(lzma_conf.clone());
                     chain.push(EncoderConfiguration::new(match bcj {
