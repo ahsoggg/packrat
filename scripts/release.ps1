@@ -2,7 +2,8 @@
 #   Packrat-Setup.exe   the installer (the same executable; it installs itself when it is named *Setup*.exe)
 #   Packrat.exe         the portable version (also what the updater downloads)
 #   packrat-cli.exe     the command-line tool
-#   SHA256SUMS.txt      checksums of the three files
+#   packrat7z.dll       the 7-Zip plugin for .prat (scripts\install_7zip_plugin.ps1 puts it in 7-Zip\Formats)
+#   SHA256SUMS.txt      checksums of the four files
 #
 #   powershell -ExecutionPolicy Bypass -File scripts\release.ps1                         # checks + build + dist\
 #   powershell -ExecutionPolicy Bypass -File scripts\release.ps1 -Publish                # ... and `gh release create`
@@ -36,17 +37,18 @@ if (Test-Path $dist) { Remove-Item -LiteralPath $dist -Recurse -Force }
 New-Item -ItemType Directory $dist | Out-Null
 Copy-Item target\release\Packrat.exe (Join-Path $dist "Packrat.exe")
 Copy-Item target\release\packrat-cli.exe (Join-Path $dist "packrat-cli.exe")
+Copy-Item target\release\packrat7z.dll (Join-Path $dist "packrat7z.dll")
 
 $cert = $null
 try { $cert = Get-ChildItem Cert:\CurrentUser\My -CodeSigningCert -ErrorAction Stop | Where-Object { $_.Subject -eq "CN=ahsoggg" } } catch { }
 if ($cert) {
-    & (Join-Path $PSScriptRoot "sign.ps1") (Join-Path $dist "Packrat.exe") (Join-Path $dist "packrat-cli.exe")
+    & (Join-Path $PSScriptRoot "sign.ps1") (Join-Path $dist "Packrat.exe") (Join-Path $dist "packrat-cli.exe") (Join-Path $dist "packrat7z.dll")
 } else {
     Write-Warning "certificate CN=ahsoggg not found - releasing UNSIGNED (scripts\make_cert.ps1 creates it)"
 }
 Copy-Item (Join-Path $dist "Packrat.exe") (Join-Path $dist "Packrat-Setup.exe")
 
-$lines = foreach ($f in "Packrat-Setup.exe", "Packrat.exe", "packrat-cli.exe") {
+$lines = foreach ($f in "Packrat-Setup.exe", "Packrat.exe", "packrat-cli.exe", "packrat7z.dll") {
     $h = (Get-FileHash (Join-Path $dist $f) -Algorithm SHA256).Hash.ToLower()
     "$h  $f"
 }

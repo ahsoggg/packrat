@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/core", "crates/cli", "crates/app"]
+members = ["crates/core", "crates/cli", "crates/app", "crates/sevenzip-plugin"]
 
 [workspace.package]
 version = "0.5.0"

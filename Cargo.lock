@@ -2004,6 +2004,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "packrat-7zip-plugin"
+version = "0.5.0"
+dependencies = [
+ "packrat-core",
+ "tempfile",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "packrat-app"
 version = "0.5.0"
 dependencies = [
