@@ -12,10 +12,12 @@ use crate::safety::{self, Limits, Risk};
 use crate::smart::{self, Layout};
 use crate::timeutil;
 use rayon::prelude::*;
-use std::collections::HashMap;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// What to do with a file that already exists at the destination.
@@ -227,13 +229,16 @@ pub fn plan(archive: &dyn Archive, opts: &ExtractOptions) -> Plan {
     }
 }
 
-/// Enforces the resource limits while data is unpacked (only when the user has not accepted the risks).
+/// Enforces the resource limits while data is unpacked (only when the user has not accepted the risks), and
+/// remembers which destination folders were already checked.
 struct Guard {
     stop: AtomicBool,
     total: AtomicU64,
     cap: Option<u64>,
     /// (archive length, max ratio, minimum size): for streams whose unpacked size is not known in advance.
     ratio: Option<(u64, f64, u64)>,
+    /// Folders (as `a/b/c`) that `safepath::ensure_dirs` has verified or created during this run.
+    checked_dirs: RwLock<HashSet<String>>,
 }
 
 impl Guard {
@@ -248,7 +253,25 @@ impl Guard {
                 opts.limits.max_total_ratio,
                 opts.limits.total_ratio_min_size,
             )),
+            checked_dirs: RwLock::default(),
         }
+    }
+
+    /// `safepath::ensure_dirs` with a memory: the "is this a link" check costs one open per path component, so
+    /// it runs once per folder instead of once per file. Extraction itself never creates links, so a folder
+    /// that was a plain folder a moment ago still is one.
+    fn ensure_dirs(&self, base: &Path, rel: &[String]) -> std::result::Result<PathBuf, safepath::DirError> {
+        let key = rel.join("/");
+        let known = self.checked_dirs.read().is_ok_and(|d| d.contains(&key));
+        if !known {
+            safepath::ensure_dirs(base, rel)?;
+            if let Ok(mut d) = self.checked_dirs.write() {
+                d.insert(key);
+            }
+        }
+        let mut dir = base.to_path_buf();
+        dir.extend(rel);
+        Ok(dir)
     }
 
     fn add(&self, n: u64) -> Result<()> {
@@ -304,6 +327,13 @@ enum Outcome {
     Denied(String, String),
 }
 
+const COPY_BUF_SIZE: usize = 256 << 10;
+
+thread_local! {
+    /// One copy buffer per worker thread instead of a fresh 256 KiB allocation for every file.
+    static COPY_BUF: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+}
+
 fn write_file(
     base: &Path,
     item: &PlannedItem,
@@ -315,57 +345,72 @@ fn write_file(
 ) -> Outcome {
     let name = entry.path.clone();
     let fail = |m: String| Outcome::Failed(name.clone(), m);
-    let parent = match safepath::ensure_dirs(base, &item.rel[..item.rel.len() - 1]) {
+    let parent = match guard.ensure_dirs(base, &item.rel[..item.rel.len() - 1]) {
         Ok(p) => p,
         Err(e) if e.denied => return Outcome::Denied(name, e.message),
         Err(e) => return fail(e.message),
     };
     let mut target = parent.join(&item.rel[item.rel.len() - 1]);
     let mut kept = None;
-    match fs::symlink_metadata(&target) {
-        Ok(meta) => {
-            let resolution = opts
-                .resolutions
-                .get(&item.index)
-                .copied()
-                .unwrap_or(opts.default_resolution);
-            match resolution {
-                Resolution::Skip => return Outcome::Skipped(target.display().to_string()),
-                Resolution::Replace => {
-                    if meta.is_dir() && !meta.file_type().is_symlink() {
-                        return fail("a folder with this name exists".into());
-                    }
-                    if let Err(e) = fs::remove_file(&target) {
-                        return fail(format!("cannot replace the existing file: {e}"));
+    progress.set_current(&entry.path);
+    let create = |t: &Path| fs::OpenOptions::new().write(true).create_new(true).open(t);
+    let create_failed = |e: io::Error, t: &Path| {
+        let message = format!("cannot create '{}': {e}", t.display());
+        if e.kind() == io::ErrorKind::PermissionDenied {
+            Outcome::Denied(name.clone(), message)
+        } else {
+            Outcome::Failed(name.clone(), message)
+        }
+    };
+    // Create first and look at what is in the way only when that fails: the common case (nothing there) costs
+    // one open instead of two, which matters with tens of thousands of small files.
+    let mut file = match create(&target) {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            match fs::symlink_metadata(&target) {
+                Ok(meta) => {
+                    let resolution = opts
+                        .resolutions
+                        .get(&item.index)
+                        .copied()
+                        .unwrap_or(opts.default_resolution);
+                    match resolution {
+                        Resolution::Skip => return Outcome::Skipped(target.display().to_string()),
+                        Resolution::Replace => {
+                            if meta.is_dir() && !meta.file_type().is_symlink() {
+                                return fail("a folder with this name exists".into());
+                            }
+                            if let Err(e) = fs::remove_file(&target) {
+                                return fail(format!("cannot replace the existing file: {e}"));
+                            }
+                        }
+                        Resolution::KeepBoth => {
+                            let new = unique_name(&target);
+                            kept = Some((target.display().to_string(), new.display().to_string()));
+                            target = new;
+                        }
                     }
                 }
-                Resolution::KeepBoth => {
-                    let new = unique_name(&target);
-                    kept = Some((target.display().to_string(), new.display().to_string()));
-                    target = new;
-                }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return fail(e.to_string()),
+            }
+            match create(&target) {
+                Ok(f) => f,
+                Err(e) => return create_failed(e, &target),
             }
         }
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-        Err(e) => return fail(e.to_string()),
-    }
-
-    progress.set_current(&entry.path);
-    let mut file = match fs::OpenOptions::new().write(true).create_new(true).open(&target) {
-        Ok(f) => f,
-        Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
-            return Outcome::Denied(name.clone(), format!("cannot create '{}': {e}", target.display()));
-        }
-        Err(e) => return fail(format!("cannot create '{}': {e}", target.display())),
+        Err(e) => return create_failed(e, &target),
     };
     let mut written = 0u64;
-    let result: io::Result<()> = (|| {
-        let mut buf = vec![0u8; 256 << 10];
+    let result: io::Result<()> = COPY_BUF.with_borrow_mut(|buf| {
+        if buf.len() < COPY_BUF_SIZE {
+            buf.resize(COPY_BUF_SIZE, 0);
+        }
         loop {
             if progress.is_cancelled() {
                 return Err(Error::Cancelled.into());
             }
-            let n = reader.read(&mut buf)?;
+            let n = reader.read(&mut buf[..])?;
             if n == 0 {
                 break;
             }
@@ -375,7 +420,7 @@ fn write_file(
             progress.add_bytes(n as u64);
         }
         file.flush()
-    })();
+    });
     match result {
         Ok(()) => {
             if opts.restore_times
