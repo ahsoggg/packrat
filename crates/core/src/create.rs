@@ -73,6 +73,8 @@ pub struct CreateOptions {
     pub dict_bytes: Option<u32>,
     /// 7z only: size of one solid block in bytes (`None`: eight dictionaries, at least 64 MiB).
     pub solid_bytes: Option<u64>,
+    /// `.prat` only: spend this percentage of the archive size on recovery data (0 = none).
+    pub recovery_percent: u32,
 }
 
 impl CreateOptions {
@@ -87,6 +89,7 @@ impl CreateOptions {
             smart: true,
             dict_bytes: None,
             solid_bytes: None,
+            recovery_percent: 0,
         }
     }
 }
@@ -144,6 +147,11 @@ pub fn create_archive(
 }
 
 fn write_to(output: &Path, items: &[InputItem], opts: &CreateOptions, progress: &Progress) -> Result<()> {
+    if opts.recovery_percent > 0 && opts.format != Format::Prat {
+        return Err(Error::Unsupported(
+            "recovery data is only available in .prat archives (--format prat)".into(),
+        ));
+    }
     let file = File::options().write(true).create_new(true).open(output)?;
     match opts.format {
         Format::Zip(method) => {
@@ -183,6 +191,9 @@ fn write_to(output: &Path, items: &[InputItem], opts: &CreateOptions, progress: 
                 popts.block_bytes = usize::try_from(b.clamp(1 << 20, 128 << 20)).unwrap_or(16 << 20);
             }
             prat::write_prat(file, items, &popts, progress)?;
+            if opts.recovery_percent > 0 {
+                prat::recover::add_recovery(output, opts.recovery_percent)?;
+            }
         }
         Format::Tar(_) if opts.password.is_some() => {
             return Err(Error::Unsupported(

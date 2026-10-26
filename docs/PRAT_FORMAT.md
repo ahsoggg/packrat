@@ -108,16 +108,45 @@ Opening an archive reads the header, the footer and the index. Extracting one fi
 chunks. Decoded blocks are kept in a small cache shared by all threads; threads that need the same block wait for
 one decode instead of repeating it.
 
+## Recovery data (optional)
+
+`--recovery PCT` appends Reed-Solomon recovery data between the index and the footer. It protects everything
+before it (header, blocks, index): that region of `protected_len` bytes is cut into `K` equal shards (the last one
+padded with zeros), `M` parity shards are computed (GF(2^16), `reed-solomon-simd`), and any `M` damaged shards can
+be rebuilt. A shard is 4 KiB to 64 KiB for most archives (about 256 shards for a small one, 64 KiB beyond 16 MiB,
+larger only if there would be more than 16384 shards); `M` is `PCT` percent of `K`, rounded up, at least 1.
+
+```
+HeaderA (104)   "PRATREC", u32 version (1), u32 shard size, u32 K, u32 M, u64 protected_len,
+                a copy of the 68-byte footer, CRC-32 of the first 100 bytes
+TableA          K CRC-32 values of the data shards, M of the parity shards, CRC-32 of the table
+TableB          the same again
+parity          M shards
+HeaderB (104)   a copy of HeaderA, at a fixed distance (172 bytes) before the end of the file
+```
+
+The footer is unchanged, and `index_offset + index_clen` is where the section starts, so a reader that does not
+know about recovery data skips it. To repair, `repair` finds the section through the footer, or through HeaderB, or
+by scanning for the magic (a candidate counts only if its numbers agree with where it sits and the file's length);
+it checks every data shard against its CRC, takes as many intact parity shards as there are damaged data shards,
+rebuilds the damaged shards, verifies each against its CRC, and writes a **new file**; the damaged original is never
+modified. Damaged tables, parity shards or headers are regenerated from the repaired data, a damaged footer is
+rewritten from its copy, so the result is byte-for-byte the archive that was written. If more areas are damaged than
+there are intact parity shards, nothing is written and the error says so.
+
+Repair holds the protected bytes and the decoder's work area in memory; archives above 3 GiB are refused for that
+reason.
+
 ## Not in version 1 yet
 
-These are planned as additions that older readers can tell apart (new codec ids, new flag bits, a version bump
-where the layout changes):
+Planned as additions that older readers can tell apart (new codec ids, new flag bits, a version bump where the
+layout changes):
 
-- recovery data (Reed-Solomon parity over the blocks and the index) and a `repair` command;
 - encryption (Argon2id key derivation, authenticated encryption, encrypted names and index);
 - multi-volume archives;
 - other block codecs (LZMA2) and filters (BCJ) per block;
-- NTFS metadata (attributes, streams, ACLs) and links.
+- NTFS metadata (attributes, streams, ACLs) and links;
+- rebuilding the index of an archive that has neither an index nor recovery data, by scanning the blocks.
 
 ## A note on ratios
 

@@ -14,8 +14,9 @@ USAGE:
                       [--skip | --overwrite | --keep-both] [--accept-risks] [--repair]
                       [--encoding NAME] [PASSWORD OPTIONS]
   packrat-cli test <archive> [--sha256] [--threads N] [--encoding NAME] [PASSWORD OPTIONS]
+  packrat-cli repair <archive.prat> [-o FIXED]   rebuild damaged areas from the recovery data (the original is kept)
   packrat-cli create <output> <paths...> [--format FMT] [--level N] [--threads N]
-                      [PASSWORD OPTIONS] [--no-encrypt-names] [--no-filters] [--dict-mb N] [--solid-mb N]
+                      [PASSWORD OPTIONS] [--no-encrypt-names] [--no-filters] [--dict-mb N] [--solid-mb N] [--recovery PCT]
   packrat-cli bench-gen <dir> [--mb N]     write the deterministic data set used by scripts/bench.ps1
   packrat-cli --version | --help
 
@@ -35,6 +36,8 @@ PASSWORD OPTIONS: --ask-password | --password-file FILE | env PACKRAT_PASSWORD
   prat is Packrat's own format: files are cut into content-defined chunks and identical chunks are stored once
   (copies, backups, versions of the same project shrink a lot), blocks are zstd (--level 1-9, --solid-mb sets
   the block size, 1-128, default 16) and every block carries a BLAKE3 hash. Only Packrat opens it for now.
+  --recovery PCT (prat only) adds Reed-Solomon recovery data of PCT percent of the archive size: any damaged
+  areas up to that amount can be rebuilt with `repair`, which writes a repaired copy and never touches the original.
   --dict-mb sets the 7z (LZMA2) dictionary and --solid-mb the size of one solid block. By default the dictionary
   follows the level (16 MiB at 5, 64 MiB at 9, never more than the data) and a block is eight dictionaries, at
   least 64 MiB; bigger values pack better and use more memory. Encoders never take more than half of free RAM.
@@ -123,6 +126,7 @@ fn main() -> ExitCode {
         "list" | "l" => cmd_list(args),
         "extract" | "x" => cmd_extract(args),
         "create" | "c" | "a" => cmd_create(args),
+        "repair" => cmd_repair(args),
         "test" | "t" => cmd_test(args),
         "bench-gen" => cmd_bench_gen(args),
         other => Err(format!("unknown command '{other}' (see --help)")),
@@ -350,6 +354,7 @@ fn cmd_create(mut args: Args) -> Result<u8, String> {
     let no_names = args.flag("--no-encrypt-names");
     let no_filters = args.flag("--no-filters");
     let dict_mb = args.number(&["--dict-mb"])?;
+    let recovery = args.number(&["--recovery"])?;
     let solid_mb = args.number(&["--solid-mb"])?;
     let oo = open_options(&mut args)?;
     let format_name = args.value(&["--format", "-f"])?;
@@ -386,6 +391,8 @@ fn cmd_create(mut args: Args) -> Result<u8, String> {
             Some(u32::try_from(mb.saturating_mul(1 << 20)).map_err(|_| "--dict-mb is too large (the limit is 1023)")?);
     }
     opts.solid_bytes = solid_mb.map(|mb| (mb as u64).saturating_mul(1 << 20));
+    opts.recovery_percent =
+        u32::try_from(recovery.unwrap_or(0)).map_err(|_| "--recovery is a percentage from 1 to 100")?;
 
     let started = std::time::Instant::now();
     let report = create_archive(&output, &inputs, &opts, &Progress::new()).map_err(|e| e.to_string())?;
@@ -501,6 +508,54 @@ fn cmd_bench_gen(mut args: Args) -> Result<u8, String> {
     }
     println!("wrote {} to {}", human(written + text_bytes + bin_bytes), dir.display());
     Ok(0)
+}
+
+fn cmd_repair(mut args: Args) -> Result<u8, String> {
+    let out = args.value(&["-o", "--output"])?;
+    let path = args.0.first().cloned().ok_or("repair: archive path is missing")?;
+    let src = PathBuf::from(&path);
+    let dst = match out {
+        Some(o) => PathBuf::from(o),
+        None => {
+            let stem = src
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            src.with_file_name(format!("{stem}.repaired.prat"))
+        }
+    };
+    let started = std::time::Instant::now();
+    match packrat_core::prat::recover::repair(&src, &dst) {
+        Ok(r) => {
+            if r.repaired == 0 && !r.footer_rewritten && !r.recovery_rewritten {
+                println!(
+                    "{path}: no damage found ({} areas checked); the copy {} is identical",
+                    r.shards,
+                    dst.display()
+                );
+            } else {
+                println!(
+                    "{path}: repaired {} of {} areas of {} KiB{} in {:.2} s -> {}",
+                    r.repaired,
+                    r.shards,
+                    r.shard_bytes >> 10,
+                    match (r.footer_rewritten, r.recovery_rewritten) {
+                        (true, true) => ", rewrote the end of the file and regenerated damaged recovery data",
+                        (true, false) => " and rewrote the end of the file",
+                        (false, true) => " and regenerated damaged recovery data",
+                        (false, false) => "",
+                    },
+                    started.elapsed().as_secs_f64(),
+                    dst.display()
+                );
+            }
+            Ok(0)
+        }
+        Err(e) => {
+            eprintln!("packrat-cli: {path}: {e}");
+            Ok(1)
+        }
+    }
 }
 
 fn cmd_test(mut args: Args) -> Result<u8, String> {

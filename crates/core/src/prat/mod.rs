@@ -3,6 +3,7 @@
 
 pub mod format;
 pub mod read;
+pub mod recover;
 pub mod write;
 
 pub use read::PratArchive;
