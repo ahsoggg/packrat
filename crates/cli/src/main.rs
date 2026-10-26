@@ -15,7 +15,7 @@ USAGE:
                       [--encoding NAME] [PASSWORD OPTIONS]
   packrat-cli test <archive> [--sha256] [--threads N] [--encoding NAME] [PASSWORD OPTIONS]
   packrat-cli create <output> <paths...> [--format FMT] [--level N] [--threads N]
-                      [PASSWORD OPTIONS] [--no-encrypt-names]
+                      [PASSWORD OPTIONS] [--no-encrypt-names] [--no-filters]
   packrat-cli bench-gen <dir> [--mb N]     write the deterministic data set used by scripts/bench.ps1
   packrat-cli --version | --help
 
@@ -30,6 +30,8 @@ EXTRACT:
 PASSWORD OPTIONS: --ask-password | --password-file FILE | env PACKRAT_PASSWORD
   Passwords are never taken from the command line. Creating: ZIP and 7z get AES-256; 7z also hides file names
   (--no-encrypt-names keeps them visible). TAR cannot be encrypted.
+  7z sorts files by type, runs a BCJ filter over executables and stores already-packed files (JPEG, MP4, ZIP...)
+  as they are; --no-filters keeps the input order and compresses everything the same way.
 
 ENCODING: for old ZIP files whose names have no encoding information, Packrat guesses (cp866, cp1251, cp437,
   shift_jis, gbk, big5, euc-kr); --encoding NAME forces one.
@@ -340,6 +342,7 @@ fn cmd_extract(mut args: Args) -> Result<u8, String> {
 
 fn cmd_create(mut args: Args) -> Result<u8, String> {
     let no_names = args.flag("--no-encrypt-names");
+    let no_filters = args.flag("--no-filters");
     let oo = open_options(&mut args)?;
     let format_name = args.value(&["--format", "-f"])?;
     let level = args.number(&["--level", "-l"])?;
@@ -368,6 +371,7 @@ fn cmd_create(mut args: Args) -> Result<u8, String> {
     opts.threads = threads;
     opts.password = oo.password;
     opts.encrypt_names = !no_names;
+    opts.smart = !no_filters;
 
     let started = std::time::Instant::now();
     let report = create_archive(&output, &inputs, &opts, &Progress::new()).map_err(|e| e.to_string())?;

@@ -1,6 +1,7 @@
 //! 7z through the pure-Rust `sevenz-rust2`. Reading is block by block (a solid block has to be decoded from
 //! its start); writing packs files into solid blocks that are compressed on worker threads.
 
+use crate::analyze::{self, Bcj, Class};
 use crate::archive::{Archive, EntryReader, Kind};
 use crate::entry::{Entry, EntryKind};
 use crate::error::{Error, Result};
@@ -88,6 +89,13 @@ impl SevenZArchive {
             .enumerate()
             .map(|(i, f)| entry_from(i, f))
             .collect();
+        // A header that was written with a short bit vector (older Packrat versions did this) parses "fine" but
+        // shifts everything after it, so names come out empty. Only a single entry may legitimately have no name.
+        if entries.iter().filter(|e| e.path.is_empty()).count() > 1 {
+            return Err(Error::Corrupt(
+                "several entries have no name: the 7z header is damaged".into(),
+            ));
+        }
         for (i, block) in archive.stream_map.file_block_index.iter().enumerate() {
             if let Some(b) = block
                 && archive.blocks[*b]
@@ -223,6 +231,8 @@ pub struct SevenZOptions {
     pub password: Option<CorePassword>,
     /// With a password: also encrypt the file names (the header).
     pub encrypt_names: bool,
+    /// Sort files by type and give executables a BCJ filter and packed data a plain copy (see `analyze`).
+    pub smart: bool,
 }
 
 impl Default for SevenZOptions {
@@ -233,6 +243,7 @@ impl Default for SevenZOptions {
             block_bytes: 64 << 20,
             password: None,
             encrypt_names: true,
+            smart: true,
         }
     }
 }
@@ -271,47 +282,76 @@ pub fn write_7z<W: Write + Seek>(out: W, items: &[InputItem], opts: &SevenZOptio
     );
     let level = opts.level.clamp(1, 9);
 
-    // plan the solid blocks
+    // Plan the solid blocks. With `smart` set, files are sorted by class and extension and a block never mixes
+    // classes, because every class has its own filter chain (BCJ for code, plain copy for packed data).
+    let mut classes = vec![Class::Data; items.len()];
+    let mut order: Vec<usize> = (0..items.len())
+        .filter(|&i| !items[i].is_dir && items[i].size != 0)
+        .collect();
+    if opts.smart {
+        for &i in &order {
+            classes[i] = analyze::classify(&items[i]);
+        }
+        order.sort_by_cached_key(|&i| analyze::solid_key(&items[i], classes[i]));
+    }
     let mut groups: Vec<Vec<usize>> = Vec::new();
+    let mut group_class: Vec<Class> = Vec::new();
     let mut cur: Vec<usize> = Vec::new();
     let mut cur_bytes = 0u64;
-    for (i, it) in items.iter().enumerate() {
-        if it.is_dir || it.size == 0 {
-            continue;
+    for &i in &order {
+        if !cur.is_empty() && classes[i] != classes[cur[0]] {
+            group_class.push(classes[cur[0]]);
+            groups.push(std::mem::take(&mut cur));
+            cur_bytes = 0;
         }
         cur.push(i);
-        cur_bytes += it.size;
+        cur_bytes += items[i].size;
         if cur_bytes >= opts.block_bytes {
+            group_class.push(classes[i]);
             groups.push(std::mem::take(&mut cur));
             cur_bytes = 0;
         }
     }
     if !cur.is_empty() {
+        group_class.push(classes[cur[0]]);
         groups.push(cur);
     }
     let threads = crate::par::resolve_threads(opts.threads);
-    let lzma = if groups.len() == 1 && threads > 1 {
+    let compressed_groups = group_class.iter().filter(|c| **c != Class::Packed).count();
+    let lzma = if compressed_groups == 1 && threads > 1 {
         Lzma2Options::from_level_mt(level, threads as u32, (opts.block_bytes / 4).max(4 << 20))
     } else {
         Lzma2Options::from_level(level)
     };
     let lzma_conf = EncoderConfiguration::new(EncoderMethod::LZMA2).with_options(EncoderOptions::Lzma2(lzma));
-    // every block gets its own random IV and salt: the chain is AES first, then LZMA2 (as 7-Zip writes it)
+    // The chain lists the stage nearest the file first. Data flows through it from the end: filter, then LZMA2,
+    // then AES (as 7-Zip writes it). Every block gets its own random IV and salt.
     let chain_for_block = {
         let (lzma_conf, password) = (lzma_conf.clone(), opts.password.clone());
-        move || -> Arc<Vec<EncoderConfiguration>> {
-            Arc::new(match &password {
-                Some(p) => vec![
-                    AesEncoderOptions::new(Password::from(p.expose())).into(),
-                    lzma_conf.clone(),
-                ],
-                None => vec![lzma_conf.clone()],
-            })
+        move |class: Class| -> Arc<Vec<EncoderConfiguration>> {
+            let mut chain = Vec::with_capacity(3);
+            if let Some(p) = &password {
+                chain.push(AesEncoderOptions::new(Password::from(p.expose())).into());
+            }
+            match class {
+                Class::Packed => chain.push(EncoderConfiguration::new(EncoderMethod::COPY)),
+                Class::Data => chain.push(lzma_conf.clone()),
+                Class::Code(bcj) => {
+                    chain.push(lzma_conf.clone());
+                    chain.push(EncoderConfiguration::new(match bcj {
+                        Bcj::X86 => EncoderMethod::BCJ_X86_FILTER,
+                        Bcj::Arm => EncoderMethod::BCJ_ARM_FILTER,
+                        Bcj::ArmThumb => EncoderMethod::BCJ_ARM_THUMB_FILTER,
+                        Bcj::Arm64 => EncoderMethod::BCJ_ARM64_FILTER,
+                    }));
+                }
+            }
+            Arc::new(chain)
         }
     };
 
     let mut writer = sevenz_rust2::ArchiveWriter::new(out).map_err(map_err)?;
-    writer.set_content_methods((*chain_for_block()).clone());
+    writer.set_content_methods((*chain_for_block(Class::Data)).clone());
     writer.set_encrypt_header(opts.encrypt_names);
     let mut pool = OrderedPool::<Piece>::new(opts.threads)?;
     let mut deliver = |piece: Piece| -> Result<()> {
@@ -335,27 +375,32 @@ pub fn write_7z<W: Write + Seek>(out: W, items: &[InputItem], opts: &SevenZOptio
         Ok(())
     };
 
-    // dirs and empty files go in item order; each group is queued when its first file is reached
+    // Dirs go in item order and each group is queued when its first file is reached. Empty files go last, after
+    // every directory: sevenz-rust2 0.24 writes the "empty file" bit vector only up to the last empty file, not
+    // up to the last empty entry, and 7-Zip rejects such a header ("Headers Error") when a directory follows an
+    // early empty file. With the empty files at the end the vector always has the full length.
     let mut group_of = vec![usize::MAX; items.len()];
     for (g, members) in groups.iter().enumerate() {
         for &i in members {
             group_of[i] = g;
         }
     }
+    let mut empty_files = Vec::new();
     for (i, it) in items.iter().enumerate() {
         progress.check()?;
         if it.is_dir {
             pool.push_ready(Piece::Dir(entry_for(it)), &mut deliver)?;
         } else if it.size == 0 {
-            pool.push_ready(Piece::Empty(entry_for(it)), &mut deliver)?;
+            empty_files.push(entry_for(it));
         } else if groups[group_of[i]][0] == i {
             let members: Vec<InputItem> = groups[group_of[i]].iter().map(|&m| items[m].clone()).collect();
             let bytes: u64 = members.iter().map(|m| m.size).sum();
             let files = members.len() as u64;
             let chain = chain_for_block.clone();
+            let class = group_class[group_of[i]];
             pool.submit(
                 move || {
-                    let methods = chain();
+                    let methods = chain(class);
                     let entries: Vec<ArchiveEntry> = members.iter().map(entry_for).collect();
                     let readers = members
                         .iter()
@@ -370,6 +415,10 @@ pub fn write_7z<W: Write + Seek>(out: W, items: &[InputItem], opts: &SevenZOptio
                 &mut deliver,
             )?;
         }
+    }
+    for e in empty_files {
+        progress.check()?;
+        pool.push_ready(Piece::Empty(e), &mut deliver)?;
     }
     pool.finish(&mut deliver)?;
     writer.finish().map_err(Error::from)?;

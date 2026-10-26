@@ -1,5 +1,6 @@
 //! Packrat core: archive formats, smart extraction and safety checks. No UI.
 
+pub mod analyze;
 pub mod ar;
 pub mod archive;
 pub mod cab;

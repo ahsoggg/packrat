@@ -62,6 +62,8 @@ pub struct CreateOptions {
     pub password: Option<Password>,
     /// 7z only: also encrypt the file names.
     pub encrypt_names: bool,
+    /// 7z only: sort files by type, filter executables (BCJ) and store already-packed files (see `analyze`).
+    pub smart: bool,
 }
 
 impl CreateOptions {
@@ -73,6 +75,7 @@ impl CreateOptions {
             threads: 0,
             password: None,
             encrypt_names: true,
+            smart: true,
         }
     }
 }
@@ -148,6 +151,7 @@ fn write_to(output: &Path, items: &[InputItem], opts: &CreateOptions, progress: 
                 threads: opts.threads,
                 password: opts.password.clone(),
                 encrypt_names: opts.encrypt_names,
+                smart: opts.smart,
                 ..Default::default()
             };
             sevenz::write_7z(file, items, &sopts, progress)?;
