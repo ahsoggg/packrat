@@ -2,13 +2,18 @@
 #
 #   powershell -ExecutionPolicy Bypass -File scripts\bench.ps1                 # 800 MB data set, 3 runs
 #   powershell -ExecutionPolicy Bypass -File scripts\bench.ps1 -SizeMb 300 -Runs 2
+#   powershell -ExecutionPolicy Bypass -File scripts\bench.ps1 -Corpus "C:\Program Files\7-Zip" -Runs 1 -Extended
 #
+# -Corpus uses a real folder instead of the generated data set (the folder is only read, never changed).
+# -Extended adds more levels (zstd 6/9, 7z 1/9) and the matching 7-Zip settings.
 # Results go to the console and to docs\bench-results.json; docs\BENCHMARKS.md describes the method.
 param(
     [int]$SizeMb = 800,
     [int]$Runs = 3,
     [string]$Work = (Join-Path $env:TEMP "packrat-bench"),
-    [string]$Json = ""
+    [string]$Json = "",
+    [string]$Corpus = "",
+    [switch]$Extended
 )
 
 $ErrorActionPreference = "Stop"
@@ -26,7 +31,11 @@ $data = Join-Path $Work "data"
 $out = Join-Path $Work "out"
 if (Test-Path $Work) { Remove-Item -LiteralPath $Work -Recurse -Force }
 New-Item -ItemType Directory $Work, $out | Out-Null
-& $cli bench-gen $data --mb $SizeMb | Out-Null
+if ($Corpus -ne "") {
+    $data = (Resolve-Path -LiteralPath $Corpus).Path
+} else {
+    & $cli bench-gen $data --mb $SizeMb | Out-Null
+}
 
 $files = Get-ChildItem $data -Recurse -File
 $srcCount = $files.Count
@@ -60,6 +69,20 @@ $creates = @(
     @{ Name = "7z LZMA2, 1 thread";      File = "s1.7z";     Cmd = { & $cli create (Join-Path $out "s1.7z") $data --format 7z --threads 1 } },
     @{ Name = "7z LZMA2, all cores";     File = "sn.7z";     Cmd = { & $cli create (Join-Path $out "sn.7z") $data --format 7z --threads 0 } }
 )
+if ($Extended) {
+    foreach ($l in 6, 9) {
+        $creates += @{ Name = "zip zstd level $l, all cores"; File = "zsl$l.zip"; Cmd = [scriptblock]::Create("& '$cli' create '$out\zsl$l.zip' '$data' --format zip-zstd --level $l --threads 0") }
+    }
+    foreach ($l in 1, 9) {
+        $creates += @{ Name = "7z LZMA2 level $l, all cores"; File = "sl$l.7z"; Cmd = [scriptblock]::Create("& '$cli' create '$out\sl$l.7z' '$data' --format 7z --level $l --threads 0") }
+    }
+    if ($haveSeven) {
+        foreach ($l in 1, 9) {
+            $creates += @{ Name = "7-Zip 7z mx$l, all cores"; File = "7s$l.7z"; Cmd = [scriptblock]::Create("& '$seven' a -t7z -mx=$l -mmt=on '$out\7s$l.7z' '$data'") }
+        }
+        $creates += @{ Name = "7-Zip 7z mx5, all cores"; File = "7s5.7z"; Cmd = { & $seven a -t7z -mx=5 -mmt=on (Join-Path $out "7s5.7z") $data } }
+    }
+}
 if ($haveSeven) {
     $creates += @{ Name = "7-Zip zip deflate, 1 thread"; File = "7z1.zip"; Cmd = { & $seven a -tzip -mx=5 -mmt=1 (Join-Path $out "7z1.zip") $data } }
     $creates += @{ Name = "7-Zip zip deflate, all cores"; File = "7zn.zip"; Cmd = { & $seven a -tzip -mx=5 -mmt=on (Join-Path $out "7zn.zip") $data } }

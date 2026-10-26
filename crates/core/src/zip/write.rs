@@ -126,7 +126,7 @@ fn compress(method: ZipMethod, level: u32, raw: Vec<u8>, last: bool, single: boo
         ZipMethod::Store => return (METHOD_STORE, raw),
         _ if raw.is_empty() => return (METHOD_STORE, raw),
         ZipMethod::Deflate => (METHOD_DEFLATE, deflate::compress_block(&raw, level, last)),
-        ZipMethod::Zstd => (METHOD_ZSTD, zstd::compress_frame(&raw)),
+        ZipMethod::Zstd => (METHOD_ZSTD, zstd::compress_frame_level(&raw, zstd::zstd_level(level))),
     };
     // Incompressible single-block files are stored as they are (a multi-block entry has one method for all blocks).
     if single && packed.1.len() >= raw.len() {

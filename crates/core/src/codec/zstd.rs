@@ -1,14 +1,25 @@
-//! Pure-Rust Zstandard. The encoder (`ruzstd`) offers one real compression level (about zstd level 1), so
-//! parallelism comes from cutting the input into blocks and compressing each block as its own frame; a
-//! sequence of frames is a valid Zstandard stream and the reader below decodes any number of them.
+//! Zstandard. The encoder is libzstd (levels 1..=22); parallelism comes from cutting the input into blocks
+//! and compressing each block as its own frame. A sequence of frames is a valid Zstandard stream, and the
+//! pure-Rust reader below (`ruzstd`) decodes any number of them.
 
 use ruzstd::decoding::FrameDecoder;
 use ruzstd::decoding::errors::{FrameDecoderError, ReadFrameHeaderError};
-use ruzstd::encoding::{CompressionLevel, compress_to_vec};
 use std::io::{self, BufRead, Read};
 
+/// Maps Packrat's 1..=9 level scale onto zstd levels: 1 is the fastest, 9 is close to `zstd -19`.
+pub fn zstd_level(level: u32) -> i32 {
+    const MAP: [i32; 9] = [1, 2, 3, 5, 7, 9, 12, 15, 19];
+    MAP[(level.clamp(1, 9) - 1) as usize]
+}
+
+/// One independent frame at a native zstd level (1..=22).
+pub fn compress_frame_level(data: &[u8], zstd_level: i32) -> Vec<u8> {
+    ::zstd::bulk::compress(data, zstd_level).expect("zstd cannot fail on in-memory input")
+}
+
+/// One independent frame at the fastest level.
 pub fn compress_frame(data: &[u8]) -> Vec<u8> {
-    compress_to_vec(data, CompressionLevel::Fastest)
+    compress_frame_level(data, 1)
 }
 
 /// Reads a stream of concatenated Zstandard frames (skippable frames are ignored).
@@ -96,6 +107,23 @@ mod tests {
         ZstdReader::new(Cursor::new(packed)).read_to_end(&mut out).unwrap();
         assert_eq!(&out[..data.len()], &data[..]);
         assert_eq!(&out[data.len()..], b"tail");
+    }
+
+    #[test]
+    fn every_level_roundtrips_and_higher_is_not_larger() {
+        let data = sample(600_000);
+        let mut prev = usize::MAX;
+        for level in 1..=9 {
+            let packed = compress_frame_level(&data, zstd_level(level));
+            let mut out = Vec::new();
+            ZstdReader::new(Cursor::new(&packed)).read_to_end(&mut out).unwrap();
+            assert_eq!(out, data, "level {level}");
+            assert!(
+                packed.len() <= prev.saturating_add(prev / 50),
+                "level {level} got much larger"
+            );
+            prev = packed.len();
+        }
     }
 
     #[test]

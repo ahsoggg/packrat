@@ -82,7 +82,7 @@ impl<W: Write + Send> FinishWrite for Plain<W> {
 #[derive(Clone, Copy)]
 enum BlockKind {
     Gzip { level: u32 },
-    Zstd,
+    Zstd { level: u32 },
     Lz4,
 }
 
@@ -123,7 +123,7 @@ struct ParWriter<W: Write + Send + 'static> {
 fn encode(kind: BlockKind, chunk: &[u8]) -> Encoded {
     let data = match kind {
         BlockKind::Gzip { level } => deflate::compress_block(chunk, level, false),
-        BlockKind::Zstd => zstd::compress_frame(chunk),
+        BlockKind::Zstd { level } => zstd::compress_frame_level(chunk, zstd::zstd_level(level)),
         BlockKind::Lz4 => {
             let info = lz4_flex::frame::FrameInfo::new().block_size(lz4_flex::frame::BlockSize::Max1MB);
             let mut enc =
@@ -147,7 +147,7 @@ impl<W: Write + Send + 'static> ParWriter<W> {
         }
         let block_size = match kind {
             BlockKind::Gzip { .. } => 1 << 20,
-            BlockKind::Zstd | BlockKind::Lz4 => 4 << 20,
+            BlockKind::Zstd { .. } | BlockKind::Lz4 => 4 << 20,
         };
         Ok(Self {
             out: Out {
@@ -204,7 +204,7 @@ impl<W: Write + Send + 'static> FinishWrite for ParWriter<W> {
                 out.inner.write_all(&out.crc.clone().finalize().to_le_bytes())?;
                 out.inner.write_all(&(out.total as u32).to_le_bytes())?;
             }
-            BlockKind::Zstd if !out.wrote_anything => out.inner.write_all(&zstd::compress_frame(b""))?,
+            BlockKind::Zstd { .. } if !out.wrote_anything => out.inner.write_all(&zstd::compress_frame(b""))?,
             BlockKind::Lz4 if !out.wrote_anything => out.inner.write_all(&encode(kind, b"").data)?,
             _ => {}
         }
@@ -233,7 +233,7 @@ impl<W: Write + Send + 'static> FinishWrite for XzOut<W> {
     }
 }
 
-/// Compression writer for `tar.*` output. `level` is 1..=9 (deflate and xz); zstd and lz4 have one level here.
+/// Compression writer for `tar.*` output. `level` is 1..=9 (deflate, zstd and xz); lz4 has one level here.
 pub fn writer<W: Write + Send + 'static>(
     c: Compression,
     out: W,
@@ -249,7 +249,7 @@ pub fn writer<W: Write + Send + 'static>(
             },
             threads,
         )?),
-        Compression::Zst => Box::new(ParWriter::new(out, BlockKind::Zstd, threads)?),
+        Compression::Zst => Box::new(ParWriter::new(out, BlockKind::Zstd { level }, threads)?),
         Compression::Lz4 => Box::new(ParWriter::new(out, BlockKind::Lz4, threads)?),
         Compression::Xz => {
             let mut opts = lzma_rust2::XzOptions::with_preset(level.clamp(1, 9));
